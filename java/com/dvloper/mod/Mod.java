@@ -28,6 +28,7 @@ import org.json.JSONObject;
 import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -52,6 +53,14 @@ public final class Mod {
     private static final List<String> logLines = new ArrayList<String>();
     private static final Map<Integer, float[]> remote = new TreeMap<Integer, float[]>();
     private static long lastUi;
+    private static boolean nativeOk;
+    private static final Map<Integer, TextView> tags = new HashMap<Integer, TextView>();
+
+    private static native void nativeSetRemote(int id, float x, float y, float z);
+
+    private static native void nativeRemoveRemote(int id);
+
+    private static native void nativeClearRemote();
 
     private Mod() {
     }
@@ -62,6 +71,7 @@ public final class Mod {
         started = true;
         try {
             System.loadLibrary("modlib");
+            nativeOk = true;
         } catch (Throwable t) {
             log("Native yüklenemedi: " + t);
         }
@@ -156,6 +166,7 @@ public final class Mod {
     private static void attach(final Activity a) {
         if (a == current && fab != null && fab.getParent() != null) return;
         current = a;
+        tags.clear();
         try {
             ViewGroup decor = (ViewGroup) a.getWindow().getDecorView();
             if (fab != null && fab.getParent() instanceof ViewGroup) {
@@ -310,6 +321,8 @@ public final class Mod {
                 synchronized (remote) {
                     remote.clear();
                 }
+                nClear();
+                clearTags();
                 myId = 0;
                 roomCode = "";
                 log("Bağlantı kapandı: " + why);
@@ -342,6 +355,7 @@ public final class Mod {
             synchronized (remote) {
                 remote.put(b[0] & 0xFF, p);
             }
+            nSet(b[0] & 0xFF, p[0], p[1], p[2]);
             long now = System.currentTimeMillis();
             if (now - lastUi > 250 && logView != null) {
                 lastUi = now;
@@ -352,6 +366,100 @@ public final class Mod {
                 });
             }
         }
+    }
+
+    private static void nSet(int id, float x, float y, float z) {
+        if (!nativeOk) return;
+        try {
+            nativeSetRemote(id, x, y, z);
+        } catch (Throwable t) {
+        }
+    }
+
+    private static void nRemove(int id) {
+        if (!nativeOk) return;
+        try {
+            nativeRemoveRemote(id);
+        } catch (Throwable t) {
+        }
+    }
+
+    private static void nClear() {
+        if (!nativeOk) return;
+        try {
+            nativeClearRemote();
+        } catch (Throwable t) {
+        }
+    }
+
+    /** Native taraftan cagrilir: uzak oyuncunun ekran konumu (nick etiketi icin). */
+    public static void onRemoteScreen(final int id, final float sx, final float sy, final float sz,
+                                      final float sw, final float sh, final float dist) {
+        UI.post(new Runnable() {
+            public void run() {
+                updateTag(id, sx, sy, sz, sw, sh, dist);
+            }
+        });
+    }
+
+    private static void updateTag(int id, float sx, float sy, float sz, float sw, float sh, float dist) {
+        Activity a = current;
+        if (a == null) return;
+        TextView tv = tags.get(id);
+        if (tv == null) {
+            try {
+                tv = new TextView(a);
+                tv.setTextColor(0xFFFFFFFF);
+                tv.setTextSize(14);
+                tv.setShadowLayer(4, 0, 0, 0xFF000000);
+                tv.setBackgroundColor(0x66000000);
+                tv.setPadding(dp(a, 6), dp(a, 2), dp(a, 6), dp(a, 2));
+                ViewGroup decor = (ViewGroup) a.getWindow().getDecorView();
+                decor.addView(tv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+                tags.put(id, tv);
+            } catch (Throwable t) {
+                return;
+            }
+        }
+        String nm;
+        synchronized (players) {
+            nm = players.get(id);
+        }
+        if (nm == null) nm = "#" + id;
+        tv.setText(nm + " (" + (int) dist + "m)");
+        if (sz <= 0 || sw <= 0 || sh <= 0) {
+            tv.setVisibility(View.GONE);
+            return;
+        }
+        View decor = a.getWindow().getDecorView();
+        float x = sx / sw * decor.getWidth();
+        float y = (1f - sy / sh) * decor.getHeight();
+        tv.setVisibility(View.VISIBLE);
+        tv.setX(x - tv.getWidth() / 2f);
+        tv.setY(y - tv.getHeight());
+    }
+
+    private static void removeTag(final int id) {
+        UI.post(new Runnable() {
+            public void run() {
+                TextView tv = tags.remove(id);
+                if (tv != null && tv.getParent() instanceof ViewGroup) {
+                    ((ViewGroup) tv.getParent()).removeView(tv);
+                }
+            }
+        });
+    }
+
+    private static void clearTags() {
+        UI.post(new Runnable() {
+            public void run() {
+                for (TextView tv : new ArrayList<TextView>(tags.values())) {
+                    if (tv.getParent() instanceof ViewGroup) ((ViewGroup) tv.getParent()).removeView(tv);
+                }
+                tags.clear();
+            }
+        });
     }
 
     private static void handleText(String s) {
@@ -387,6 +495,8 @@ public final class Mod {
                 synchronized (remote) {
                     remote.remove(id);
                 }
+                nRemove(id);
+                removeTag(id);
                 hostId = o.optInt("host", hostId);
                 log("#" + id + " ayrıldı" + (hostId == myId ? " (artık HOST sensin)" : ""));
             } else if ("chat".equals(t)) {

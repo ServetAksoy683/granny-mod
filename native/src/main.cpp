@@ -20,6 +20,7 @@ static JavaVM *g_vm = nullptr;
 static jclass g_modClass = nullptr;
 static jmethodID g_onPos = nullptr;
 static jmethodID g_onLog = nullptr;
+static jmethodID g_onTag = nullptr;
 static uintptr_t g_base = 0;
 
 struct Vec3 { float x, y, z; };
@@ -92,42 +93,65 @@ static void jlog(const char *msg) {
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
-// Hangi motor fonksiyonlari kullanilabilir? (hayalet oyuncu icin kesif)
-static void probe_icalls() {
-    void *h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!h) {
-        jlog("probe: libil2cpp handle yok");
-        return;
-    }
-    typedef void *(*ResolveFn)(const char *);
-    ResolveFn resolve = (ResolveFn) dlsym(h, "il2cpp_resolve_icall");
-    if (!resolve) {
-        jlog("probe: il2cpp_resolve_icall yok");
-        return;
-    }
-    const char *names[] = {
-            "UnityEngine.GameObject::CreatePrimitive",
-            "UnityEngine.GameObject::Internal_CreateGameObject",
-            "UnityEngine.Resources::GetBuiltinResource",
-            "UnityEngine.Camera::get_main",
-            "UnityEngine.Camera::WorldToScreenPoint_Injected",
-    };
-    for (const char *n : names) {
-        void *p = resolve(n);
-        char buf[160];
-        snprintf(buf, sizeof(buf), "probe %s = %s", n, p ? "VAR" : "yok");
-        jlog(buf);
-    }
-}
-
 static FixedUpdateFn orig_FixedUpdate = nullptr;
 static int g_tick = 0;
 static bool g_firstPos = false;
 
+// --- Uzak oyuncular (Java'dan gelir, oyun ana is parcaciginda okunur) ---
+struct Remote {
+    int id;
+    float x, y, z;
+    bool used;
+};
+static Remote g_remote[8];
+static pthread_mutex_t g_rm = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_remoteCount = 0;
+
+typedef void *(*GetCamFn)(const void *mi);
+typedef Vec3 (*W2SFn)(void *cam, Vec3 pos, const void *mi);
+typedef int (*GetIntFn)(const void *mi);
+static const uintptr_t RVA_CAM_MAIN = 0x2A6DBF8;     // Camera.get_main
+static const uintptr_t RVA_W2S = 0x2A6D978;          // Camera.WorldToScreenPoint(Vector3)
+static const uintptr_t RVA_SCREEN_W = 0x2A7695C;     // Screen.get_width
+static const uintptr_t RVA_SCREEN_H = 0x2A76984;     // Screen.get_height
+
+static void update_tags(const Vec3 &me) {
+    Remote snap[8];
+    int n = 0;
+    pthread_mutex_lock(&g_rm);
+    for (int i = 0; i < 8; i++) if (g_remote[i].used) snap[n++] = g_remote[i];
+    pthread_mutex_unlock(&g_rm);
+    if (n == 0) return;
+    JNIEnv *env = env_for_thread();
+    if (!env || !g_modClass || !g_onTag) return;
+
+    void *cam = ((GetCamFn) (g_base + RVA_CAM_MAIN))(nullptr);
+    int sw = ((GetIntFn) (g_base + RVA_SCREEN_W))(nullptr);
+    int sh = ((GetIntFn) (g_base + RVA_SCREEN_H))(nullptr);
+    for (int i = 0; i < n; i++) {
+        float sx = 0, sy = 0, sz = -1;
+        if (cam) {
+            Vec3 wp = {snap[i].x, snap[i].y + 0.8f, snap[i].z};
+            Vec3 sp = ((W2SFn) (g_base + RVA_W2S))(cam, wp, nullptr);
+            sx = sp.x;
+            sy = sp.y;
+            sz = sp.z;
+        }
+        float dx = snap[i].x - me.x, dy = snap[i].y - me.y, dz = snap[i].z - me.z;
+        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        env->CallStaticVoidMethod(g_modClass, g_onTag, (jint) snap[i].id, sx, sy, sz,
+                                  (jfloat) sw, (jfloat) sh, dist);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+}
+
 static void hook_FixedUpdate(void *self, const void *mi) {
     orig_FixedUpdate(self, mi);
     if (!self || !g_base) return;
-    if (++g_tick % 5 != 0) return; // 50 Hz -> 10 Hz
+    g_tick++;
+    bool doSend = (g_tick % 5 == 0);          // 50 Hz -> 10 Hz
+    bool doTags = (g_tick % 2 == 0) && g_remoteCount > 0; // 25 Hz
+    if (!doSend && !doTags) return;
 
     void *tr = *(void **) ((uintptr_t) self + OFF_THIS_TRANSFORM);
     if (!tr) return;
@@ -138,20 +162,61 @@ static void hook_FixedUpdate(void *self, const void *mi) {
     Quat q = {0, 0, 0, 1};
     ((GetVec3Fn) (g_base + RVA_GET_POS))(cached, &p, nullptr);
     ((GetQuatFn) (g_base + RVA_GET_ROT))(cached, &q, nullptr);
-    float yaw = atan2f(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.x * q.x)) * 57.29578f;
 
-    if (!g_firstPos) {
-        g_firstPos = true;
-        probe_icalls();
-        char buf[96];
-        snprintf(buf, sizeof(buf), "Ilk konum okundu: %.1f %.1f %.1f", p.x, p.y, p.z);
-        jlog(buf);
+    if (doSend) {
+        float yaw = atan2f(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.x * q.x)) * 57.29578f;
+        if (!g_firstPos) {
+            g_firstPos = true;
+            char buf[96];
+            snprintf(buf, sizeof(buf), "Ilk konum okundu: %.1f %.1f %.1f", p.x, p.y, p.z);
+            jlog(buf);
+        }
+        JNIEnv *env = env_for_thread();
+        if (env && g_modClass && g_onPos) {
+            env->CallStaticVoidMethod(g_modClass, g_onPos, p.x, p.y, p.z, yaw);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
     }
+    if (doTags) update_tags(p);
+}
 
-    JNIEnv *env = env_for_thread();
-    if (!env || !g_modClass || !g_onPos) return;
-    env->CallStaticVoidMethod(g_modClass, g_onPos, p.x, p.y, p.z, yaw);
-    if (env->ExceptionCheck()) env->ExceptionClear();
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeSetRemote(JNIEnv *, jclass, jint id, jfloat x, jfloat y, jfloat z) {
+    pthread_mutex_lock(&g_rm);
+    int slot = -1;
+    for (int i = 0; i < 8; i++) if (g_remote[i].used && g_remote[i].id == id) slot = i;
+    if (slot < 0) for (int i = 0; i < 8; i++) if (!g_remote[i].used) { slot = i; break; }
+    if (slot >= 0) {
+        g_remote[slot].used = true;
+        g_remote[slot].id = id;
+        g_remote[slot].x = x;
+        g_remote[slot].y = y;
+        g_remote[slot].z = z;
+    }
+    int c = 0;
+    for (int i = 0; i < 8; i++) if (g_remote[i].used) c++;
+    g_remoteCount = c;
+    pthread_mutex_unlock(&g_rm);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeRemoveRemote(JNIEnv *, jclass, jint id) {
+    pthread_mutex_lock(&g_rm);
+    int c = 0;
+    for (int i = 0; i < 8; i++) {
+        if (g_remote[i].used && g_remote[i].id == id) g_remote[i].used = false;
+        if (g_remote[i].used) c++;
+    }
+    g_remoteCount = c;
+    pthread_mutex_unlock(&g_rm);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeClearRemote(JNIEnv *, jclass) {
+    pthread_mutex_lock(&g_rm);
+    for (int i = 0; i < 8; i++) g_remote[i].used = false;
+    g_remoteCount = 0;
+    pthread_mutex_unlock(&g_rm);
 }
 
 static int phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
@@ -203,6 +268,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     g_modClass = (jclass) env->NewGlobalRef(c);
     g_onPos = env->GetStaticMethodID(c, "onLocalPos", "(FFFF)V");
     g_onLog = env->GetStaticMethodID(c, "nativeLog", "(Ljava/lang/String;)V");
+    g_onTag = env->GetStaticMethodID(c, "onRemoteScreen", "(IFFFFFF)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     pthread_t t;
     pthread_create(&t, nullptr, init_thread, nullptr);
