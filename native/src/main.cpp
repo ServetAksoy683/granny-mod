@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <dlfcn.h>
 
 #define TAG "GrannyMP"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -91,6 +92,34 @@ static void jlog(const char *msg) {
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
+// Hangi motor fonksiyonlari kullanilabilir? (hayalet oyuncu icin kesif)
+static void probe_icalls() {
+    void *h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) {
+        jlog("probe: libil2cpp handle yok");
+        return;
+    }
+    typedef void *(*ResolveFn)(const char *);
+    ResolveFn resolve = (ResolveFn) dlsym(h, "il2cpp_resolve_icall");
+    if (!resolve) {
+        jlog("probe: il2cpp_resolve_icall yok");
+        return;
+    }
+    const char *names[] = {
+            "UnityEngine.GameObject::CreatePrimitive",
+            "UnityEngine.GameObject::Internal_CreateGameObject",
+            "UnityEngine.Resources::GetBuiltinResource",
+            "UnityEngine.Camera::get_main",
+            "UnityEngine.Camera::WorldToScreenPoint_Injected",
+    };
+    for (const char *n : names) {
+        void *p = resolve(n);
+        char buf[160];
+        snprintf(buf, sizeof(buf), "probe %s = %s", n, p ? "VAR" : "yok");
+        jlog(buf);
+    }
+}
+
 static FixedUpdateFn orig_FixedUpdate = nullptr;
 static int g_tick = 0;
 static bool g_firstPos = false;
@@ -113,6 +142,7 @@ static void hook_FixedUpdate(void *self, const void *mi) {
 
     if (!g_firstPos) {
         g_firstPos = true;
+        probe_icalls();
         char buf[96];
         snprintf(buf, sizeof(buf), "Ilk konum okundu: %.1f %.1f %.1f", p.x, p.y, p.z);
         jlog(buf);
