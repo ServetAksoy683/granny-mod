@@ -26,6 +26,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.net.URLEncoder;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -43,12 +44,14 @@ public final class Mod {
     private static Button fab;
     private static AlertDialog dialog;
     private static TextView logView;
-    private static Net net;
-    private static int myId;
+    private static volatile Net net;
+    private static volatile int myId;
     private static int hostId;
     private static String roomCode = "";
     private static final Map<Integer, String> players = new TreeMap<Integer, String>();
     private static final List<String> logLines = new ArrayList<String>();
+    private static final Map<Integer, float[]> remote = new TreeMap<Integer, float[]>();
+    private static long lastUi;
 
     private Mod() {
     }
@@ -57,6 +60,11 @@ public final class Mod {
     public static synchronized void init() {
         if (started) return;
         started = true;
+        try {
+            System.loadLibrary("modlib");
+        } catch (Throwable t) {
+            log("Native yüklenemedi: " + t);
+        }
         Thread t = new Thread(new Runnable() {
             public void run() {
                 waitForApp();
@@ -291,13 +299,16 @@ public final class Mod {
             }
 
             public void onBinary(byte[] b) {
-                // ilerideki surumlerde oyuncu verisi buraya gelecek
+                if (net == holder[0]) handleBinary(b);
             }
 
             public void onClose(String why) {
                 if (net != holder[0]) return;
                 synchronized (players) {
                     players.clear();
+                }
+                synchronized (remote) {
+                    remote.clear();
                 }
                 myId = 0;
                 roomCode = "";
@@ -308,6 +319,39 @@ public final class Mod {
         net = n;
         log("Bağlanıyor...");
         n.connect(HOST, path);
+    }
+
+    /** Native taraftan cagrilir (oyun ana is parcacigi, ~10 Hz). */
+    public static void onLocalPos(float x, float y, float z, float yaw) {
+        Net n = net;
+        if (n == null || !n.isOpen() || myId <= 0) return;
+        ByteBuffer bb = ByteBuffer.allocate(17);
+        bb.put((byte) 1).putFloat(x).putFloat(y).putFloat(z).putFloat(yaw);
+        n.sendBinary(bb.array());
+    }
+
+    /** Native taraftan mesaj yazdirir. */
+    public static void nativeLog(String s) {
+        log(s);
+    }
+
+    private static void handleBinary(byte[] b) {
+        if (b.length >= 18 && b[1] == 1) {
+            ByteBuffer bb = ByteBuffer.wrap(b, 2, 16);
+            float[] p = new float[]{bb.getFloat(), bb.getFloat(), bb.getFloat(), bb.getFloat()};
+            synchronized (remote) {
+                remote.put(b[0] & 0xFF, p);
+            }
+            long now = System.currentTimeMillis();
+            if (now - lastUi > 250 && logView != null) {
+                lastUi = now;
+                UI.post(new Runnable() {
+                    public void run() {
+                        refreshLog();
+                    }
+                });
+            }
+        }
     }
 
     private static void handleText(String s) {
@@ -339,6 +383,9 @@ public final class Mod {
                 int id = o.getInt("id");
                 synchronized (players) {
                     players.remove(id);
+                }
+                synchronized (remote) {
+                    remote.remove(id);
                 }
                 hostId = o.optInt("host", hostId);
                 log("#" + id + " ayrıldı" + (hostId == myId ? " (artık HOST sensin)" : ""));
@@ -393,6 +440,13 @@ public final class Mod {
                     sb.append('#').append(e.getKey()).append(' ').append(e.getValue());
                     if (e.getKey() == hostId) sb.append(" (HOST)");
                 }
+            }
+        }
+        synchronized (remote) {
+            for (Map.Entry<Integer, float[]> e : remote.entrySet()) {
+                float[] p = e.getValue();
+                sb.append("\n#").append(e.getKey()).append(String.format(Locale.US,
+                        " konum: %.1f %.1f %.1f  yön: %.0f", p[0], p[1], p[2], p[3]));
             }
         }
         tv.setText(sb.toString());

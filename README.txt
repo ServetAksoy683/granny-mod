@@ -1,5 +1,4 @@
-Granny MP mod (v0.1: menu + oda baglantisi)
-1) Bu klasoru GitHub'da yeni bir depoya yukle (.github klasoru dahil).
-2) Actions sekmesi -> build-dex -> Run workflow (ya da push sonrasi kendiliginden calisir).
-3) Biten calismadan "classes6-dex" artifact'ini indir, icindeki classes6.dex dosyasini APK'nin kokune ekle.
-4) SafeDKApplication <clinit> icine Mod.init() cagrisini ekle (SafeDKApplication_patched.smali.txt).
+Granny MP mod v0.2 (konum okuma)
+Actions -> build-mod -> mod-files artifact'i: classes6.dex + lib/arm64-v8a/libmodlib.so
+APK'ya: classes6.dex kok dizine, libmodlib.so lib/arm64-v8a/ icine. lib/armeabi-v7a silinsin.
+RVA degerleri Granny 1.8.12 (arm64) surumune aittir.
