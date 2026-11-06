@@ -62,6 +62,8 @@ public final class Mod {
 
     private static native void nativeClearRemote();
 
+    private static native void nativeStartGame();
+
     private Mod() {
     }
 
@@ -247,6 +249,31 @@ public final class Mod {
         });
         root.addView(join);
 
+        Button start = new Button(a);
+        start.setText("Oyunu başlat (host)");
+        start.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                Net n = net;
+                if (n == null || !n.isOpen() || myId <= 0) {
+                    log("Önce bir odaya bağlan");
+                    return;
+                }
+                if (myId != hostId) {
+                    log("Sadece host oyunu başlatabilir");
+                    return;
+                }
+                try {
+                    JSONObject o = new JSONObject();
+                    o.put("t", "start");
+                    n.sendText(o.toString());
+                } catch (Exception e) {
+                }
+                log("Oyun başlatılıyor (zorluk: menüdeki seçimin)");
+                nStart();
+            }
+        });
+        root.addView(start);
+
         Button test = new Button(a);
         test.setText("Test mesajı gönder");
         test.setOnClickListener(new View.OnClickListener() {
@@ -384,6 +411,40 @@ public final class Mod {
         }
     }
 
+    private static void nStart() {
+        if (!nativeOk) {
+            log("Native yüklü değil");
+            return;
+        }
+        try {
+            nativeStartGame();
+        } catch (Throwable t) {
+            log("Başlatılamadı: " + t);
+        }
+    }
+
+    private static void promptStart() {
+        UI.post(new Runnable() {
+            public void run() {
+                Activity a = current;
+                if (a == null) return;
+                try {
+                    new AlertDialog.Builder(a)
+                            .setTitle("Oyun başlıyor")
+                            .setMessage("Host oyunu başlattı. Katılmak ister misin?")
+                            .setPositiveButton("Katıl", new DialogInterface.OnClickListener() {
+                                public void onClick(DialogInterface d, int w) {
+                                    nStart();
+                                }
+                            })
+                            .setNegativeButton("İptal", null)
+                            .show();
+                } catch (Throwable t) {
+                }
+            }
+        });
+    }
+
     private static void nClear() {
         if (!nativeOk) return;
         try {
@@ -499,6 +560,8 @@ public final class Mod {
                 removeTag(id);
                 hostId = o.optInt("host", hostId);
                 log("#" + id + " ayrıldı" + (hostId == myId ? " (artık HOST sensin)" : ""));
+            } else if ("start".equals(t)) {
+                if (o.optInt("from") == hostId) promptStart();
             } else if ("chat".equals(t)) {
                 log("#" + o.optInt("from") + ": " + o.optString("m"));
             }

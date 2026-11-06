@@ -262,6 +262,35 @@ Java_com_dvloper_mod_Mod_nativeClearRemote(JNIEnv *, jclass) {
     pthread_mutex_unlock(&g_rm);
 }
 
+// --- Ana is parcacigi pompasi: EventSystem.Update (menu ve oyunda calisir) ---
+typedef void (*UpdateFn)(void *self, const void *mi);
+typedef void *(*StringNewFn)(const char *);
+typedef void (*LoadSceneFn)(void *name, const void *mi);
+static UpdateFn orig_EsUpdate = nullptr;
+static volatile int g_startReq = 0;
+static const uintptr_t RVA_ES_UPDATE = 0x2D5E590;   // EventSystem.Update
+static const uintptr_t RVA_LOAD_SCENE = 0x2AAF058;  // SceneManager.LoadScene(string)
+
+static void hook_EsUpdate(void *self, const void *mi) {
+    orig_EsUpdate(self, mi);
+    if (!g_startReq) return;
+    g_startReq = 0;
+    void *h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    StringNewFn sn = h ? (StringNewFn) dlsym(h, "il2cpp_string_new") : nullptr;
+    if (!sn) {
+        jlog("sahne: il2cpp_string_new bulunamadi");
+        return;
+    }
+    jlog("Sahne yukleniyor: Scene");
+    void *nm = sn("Scene");
+    ((LoadSceneFn) (g_base + RVA_LOAD_SCENE))(nm, nullptr);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeStartGame(JNIEnv *, jclass) {
+    g_startReq = 1;
+}
+
 static int phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     if (info->dlpi_name && strstr(info->dlpi_name, "libil2cpp.so")) {
         *(uintptr_t *) data = (uintptr_t) info->dlpi_addr;
@@ -289,6 +318,15 @@ static void *init_thread(void *) {
     if (r == 0) {
         orig_FixedUpdate = (FixedUpdateFn) orig;
         jlog("Hook kuruldu (FPSControllerNEW)");
+        static const uint32_t expect2[4] = {0xa9bc67fe, 0xa9015ff8, 0xa90257f6, 0xa9034ff4};
+        void *orig2 = nullptr;
+        int r2 = inline_hook((void *) (base + RVA_ES_UPDATE), (void *) hook_EsUpdate, &orig2, expect2);
+        if (r2 == 0) {
+            orig_EsUpdate = (UpdateFn) orig2;
+            jlog("Hook kuruldu (EventSystem)");
+        } else {
+            jlog(r2 == 1 ? "EventSystem hook: imza uyusmuyor" : "EventSystem hook basarisiz");
+        }
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
