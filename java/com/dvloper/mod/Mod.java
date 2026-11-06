@@ -427,7 +427,10 @@ public final class Mod {
         UI.post(new Runnable() {
             public void run() {
                 Activity a = current;
-                if (a == null) return;
+                if (a == null) {
+                    log("Katılma penceresi açılamadı (aktivite yok)");
+                    return;
+                }
                 try {
                     new AlertDialog.Builder(a)
                             .setTitle("Oyun başlıyor")
@@ -440,6 +443,7 @@ public final class Mod {
                             .setNegativeButton("İptal", null)
                             .show();
                 } catch (Throwable t) {
+                    log("Katılma penceresi hatası: " + t);
                 }
             }
         });
@@ -561,7 +565,9 @@ public final class Mod {
                 hostId = o.optInt("host", hostId);
                 log("#" + id + " ayrıldı" + (hostId == myId ? " (artık HOST sensin)" : ""));
             } else if ("start".equals(t)) {
-                if (o.optInt("from") == hostId) promptStart();
+                int from = o.optInt("from");
+                log("Başlat mesajı geldi (gönderen #" + from + ", host #" + hostId + ")");
+                if (from == hostId) promptStart();
             } else if ("chat".equals(t)) {
                 log("#" + o.optInt("from") + ": " + o.optString("m"));
             }
