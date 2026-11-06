@@ -131,7 +131,7 @@ static void update_tags(const Vec3 &me) {
     for (int i = 0; i < n; i++) {
         float sx = 0, sy = 0, sz = -1;
         if (cam) {
-            Vec3 wp = {snap[i].x, snap[i].y + 0.8f, snap[i].z};
+            Vec3 wp = {snap[i].x, snap[i].y + 2.0f, snap[i].z};
             Vec3 sp = ((W2SFn) (g_base + RVA_W2S))(cam, wp, nullptr);
             sx = sp.x;
             sy = sp.y;
@@ -139,6 +139,14 @@ static void update_tags(const Vec3 &me) {
         }
         float dx = snap[i].x - me.x, dy = snap[i].y - me.y, dz = snap[i].z - me.z;
         float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        static int dbgCall = 0, dbgLogs = 0;
+        if (i == 0 && dbgLogs < 6 && (dbgCall++ % 50) == 0) {
+            dbgLogs++;
+            char b[160];
+            snprintf(b, sizeof(b), "etiket: cam=%s ekran=%dx%d sx=%.0f sy=%.0f sz=%.1f mesafe=%.1f",
+                     cam ? "var" : "YOK", sw, sh, sx, sy, sz, dist);
+            jlog(b);
+        }
         env->CallStaticVoidMethod(g_modClass, g_onTag, (jint) snap[i].id, sx, sy, sz,
                                   (jfloat) sw, (jfloat) sh, dist);
         if (env->ExceptionCheck()) env->ExceptionClear();
