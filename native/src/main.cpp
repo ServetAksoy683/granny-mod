@@ -115,7 +115,24 @@ static const uintptr_t RVA_W2S = 0x2A6D978;          // Camera.WorldToScreenPoin
 static const uintptr_t RVA_SCREEN_W = 0x2A7695C;     // Screen.get_width
 static const uintptr_t RVA_SCREEN_H = 0x2A76984;     // Screen.get_height
 
-static void update_tags(const Vec3 &me) {
+// Kamera nesnesine ulasilamadigi icin (Camera.main bos) projeksiyonu kendimiz hesapliyoruz.
+// Kamera = FPSControllerNEW.cameraPivot. Dikey gorus acisi tahminidir (derece).
+static const uintptr_t OFF_CAMERA_PIVOT = 0x38;
+static float g_fovDeg = 60.0f;
+
+static Vec3 rot_inv(const Quat &q, const Vec3 &v) {
+    float qx = -q.x, qy = -q.y, qz = -q.z, qw = q.w; // eslenik
+    float tx = 2.0f * (qy * v.z - qz * v.y);
+    float ty = 2.0f * (qz * v.x - qx * v.z);
+    float tz = 2.0f * (qx * v.y - qy * v.x);
+    Vec3 r;
+    r.x = v.x + qw * tx + (qy * tz - qz * ty);
+    r.y = v.y + qw * ty + (qz * tx - qx * tz);
+    r.z = v.z + qw * tz + (qx * ty - qy * tx);
+    return r;
+}
+
+static void update_tags(const Vec3 &me, intptr_t pivotPtr) {
     Remote snap[8];
     int n = 0;
     pthread_mutex_lock(&g_rm);
@@ -125,26 +142,40 @@ static void update_tags(const Vec3 &me) {
     JNIEnv *env = env_for_thread();
     if (!env || !g_modClass || !g_onTag) return;
 
-    void *cam = ((GetCamFn) (g_base + RVA_CAM_MAIN))(nullptr);
     int sw = ((GetIntFn) (g_base + RVA_SCREEN_W))(nullptr);
     int sh = ((GetIntFn) (g_base + RVA_SCREEN_H))(nullptr);
+
+    Vec3 cp = me;
+    Quat cq = {0, 0, 0, 1};
+    bool haveCam = false;
+    if (pivotPtr) {
+        ((GetVec3Fn) (g_base + RVA_GET_POS))(pivotPtr, &cp, nullptr);
+        ((GetQuatFn) (g_base + RVA_GET_ROT))(pivotPtr, &cq, nullptr);
+        haveCam = true;
+    }
+    float eyeH = cp.y - me.y;
+    float tanHalf = tanf(g_fovDeg * 0.5f * 0.01745329f);
+    float aspect = (sh > 0) ? (float) sw / (float) sh : 1.7778f;
+
     for (int i = 0; i < n; i++) {
         float sx = 0, sy = 0, sz = -1;
-        if (cam) {
-            Vec3 wp = {snap[i].x, snap[i].y + 2.0f, snap[i].z};
-            Vec3 sp = ((W2SFn) (g_base + RVA_W2S))(cam, wp, nullptr);
-            sx = sp.x;
-            sy = sp.y;
-            sz = sp.z;
+        Vec3 d = {snap[i].x - cp.x, snap[i].y + eyeH + 0.5f - cp.y, snap[i].z - cp.z};
+        if (haveCam && sh > 0) {
+            Vec3 c = rot_inv(cq, d);
+            if (c.z > 0.1f) {
+                sz = c.z;
+                sx = (c.x / (c.z * tanHalf * aspect) * 0.5f + 0.5f) * (float) sw;
+                sy = (c.y / (c.z * tanHalf) * 0.5f + 0.5f) * (float) sh;
+            }
         }
         float dx = snap[i].x - me.x, dy = snap[i].y - me.y, dz = snap[i].z - me.z;
         float dist = sqrtf(dx * dx + dy * dy + dz * dz);
         static int dbgCall = 0, dbgLogs = 0;
-        if (i == 0 && dbgLogs < 6 && (dbgCall++ % 50) == 0) {
+        if (i == 0 && dbgLogs < 4 && (dbgCall++ % 75) == 0) {
             dbgLogs++;
             char b[160];
-            snprintf(b, sizeof(b), "etiket: cam=%s ekran=%dx%d sx=%.0f sy=%.0f sz=%.1f mesafe=%.1f",
-                     cam ? "var" : "YOK", sw, sh, sx, sy, sz, dist);
+            snprintf(b, sizeof(b), "etiket: kamera=%s sx=%.0f sy=%.0f sz=%.1f mesafe=%.1f",
+                     haveCam ? "var" : "YOK", sx, sy, sz, dist);
             jlog(b);
         }
         env->CallStaticVoidMethod(g_modClass, g_onTag, (jint) snap[i].id, sx, sy, sz,
@@ -185,7 +216,11 @@ static void hook_FixedUpdate(void *self, const void *mi) {
             if (env->ExceptionCheck()) env->ExceptionClear();
         }
     }
-    if (doTags) update_tags(p);
+    if (doTags) {
+        void *pv = *(void **) ((uintptr_t) self + OFF_CAMERA_PIVOT);
+        intptr_t pc = pv ? *(intptr_t *) ((uintptr_t) pv + OFF_CACHED_PTR) : 0;
+        update_tags(p, pc);
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
