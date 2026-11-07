@@ -41,8 +41,10 @@ static const uintptr_t OFF_THIS_TRANSFORM = 0x68;
 static const uintptr_t OFF_CACHED_PTR = 0x10;
 
 // ---- Basit arm64 inline hook (Dobby gerektirmez) ----
-// Hedef fonksiyonun ilk 16 baytini (4 komut) kopyalar. Bu komutlar PC-bagimli olmamalidir.
-// Donus: 0 = tamam, 1 = imza uyusmuyor (farkli oyun surumu), 2 = mmap, 3 = mprotect
+// Hedef fonksiyonun ilk 16 baytini (4 komut) trambolene kopyalar. ADRP komutlari
+// mutlak adrese cevrilir; baska PC-bagimli komut varsa desteklenmez.
+// Donus: 0 = tamam, 1 = imza uyusmuyor (farkli oyun surumu), 2 = mmap, 3 = mprotect,
+//        4 = desteklenmeyen PC-bagimli komut
 static int inline_hook(void *target, void *hook, void **orig, const uint32_t expect[4]) {
     uint32_t *t = (uint32_t *) target;
     for (int i = 0; i < 4; i++) {
@@ -51,11 +53,35 @@ static int inline_hook(void *target, void *hook, void **orig, const uint32_t exp
     void *mem = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) return 2;
     uint32_t *tr = (uint32_t *) mem;
-    memcpy(tr, t, 16);
+    uint64_t lits[4];
+    int nl = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = t[i];
+        if ((w & 0x9F000000) == 0x90000000) { // ADRP
+            uint32_t rd = w & 0x1F;
+            int64_t immhi = (w >> 5) & 0x7FFFF;
+            int64_t immlo = (w >> 29) & 3;
+            int64_t imm = (immhi << 2) | immlo;
+            if (imm & 0x100000) imm -= 0x200000;
+            uint64_t pc = (uint64_t) (t + i);
+            uint64_t page = (pc & ~0xFFFULL) + (uint64_t) (imm * 4096);
+            int litOff = 32 + 8 * nl - 4 * i; // bayt
+            tr[i] = 0x58000000 | ((uint32_t) (litOff / 4) << 5) | rd; // ldr xd, literal
+            lits[nl++] = page;
+        } else if ((w & 0x9F000000) == 0x10000000 || (w & 0x3B000000) == 0x18000000 ||
+                   (w & 0x7C000000) == 0x14000000 || (w & 0x7E000000) == 0x34000000 ||
+                   (w & 0x7E000000) == 0x36000000 || (w & 0xFF000010) == 0x54000000) {
+            munmap(mem, 4096);
+            return 4;
+        } else {
+            tr[i] = w;
+        }
+    }
     tr[4] = 0x58000050; // ldr x16, #8
     tr[5] = 0xd61f0200; // br  x16
     *(uint64_t *) (tr + 6) = (uint64_t) (t + 4);
-    __builtin___clear_cache((char *) mem, (char *) mem + 32);
+    for (int j = 0; j < nl; j++) *(uint64_t *) (tr + 8 + 2 * j) = lits[j];
+    __builtin___clear_cache((char *) mem, (char *) mem + 64);
     if (mprotect(mem, 4096, PROT_READ | PROT_EXEC) != 0) return 3;
 
     long ps = sysconf(_SC_PAGESIZE);
@@ -341,6 +367,37 @@ static void hook_KofotStart(void *self, const void *mi) {
     log_place("kofot", *(int *) ((uintptr_t) self + 0x38));
 }
 
+// --- Gun baslangici: StartNewDay (esya yerlesimi) rastgele sayilari tohumlanir ---
+typedef bool (*MoveNextFn)(void *self, const void *mi);
+static MoveNextFn orig_DayStart = nullptr;
+static MoveNextFn orig_DayAds = nullptr;
+static const uintptr_t RVA_DAY_START = 0x154F254;  // StartNewDay.<Start>d__132.MoveNext
+static const uintptr_t RVA_DAY_ADS = 0x1550B38;    // StartNewDay.<newDayAfterADS>d__142.MoveNext
+static int g_dayLogs = 0;
+
+static void day_seed(void *self, int salt, const char *name) {
+    int st = *(int *) ((uintptr_t) self + 0x10); // <>1__state
+    int seed = g_gameSeed;
+    if (seed == 0) return;
+    ((InitStateFn) (g_base + RVA_RANDOM_INIT))(seed * 131 + st + salt, nullptr);
+    if (g_dayLogs < 6) {
+        g_dayLogs++;
+        char b[96];
+        snprintf(b, sizeof(b), "gun tohumu: %s durum=%d (tohum %d)", name, st, seed);
+        jlog(b);
+    }
+}
+
+static bool hook_DayStart(void *self, const void *mi) {
+    day_seed(self, 7, "Start");
+    return orig_DayStart(self, mi);
+}
+
+static bool hook_DayAds(void *self, const void *mi) {
+    day_seed(self, 11, "YeniGun");
+    return orig_DayAds(self, mi);
+}
+
 static int phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     if (info->dlpi_name && strstr(info->dlpi_name, "libil2cpp.so")) {
         *(uintptr_t *) data = (uintptr_t) info->dlpi_addr;
@@ -389,6 +446,16 @@ static void *init_thread(void *) {
         char hb[80];
         snprintf(hb, sizeof(hb), "Yerlesim hook: anahtar=%d dunk=%d kofot=%d (0=tamam)", r3, r4, r5);
         jlog(hb);
+        static const uint32_t expDay1[4] = {0xa9bd5ffe, 0xa90157f6, 0xa9024ff4, 0xb000dc54};
+        static const uint32_t expDay2[4] = {0xfc1a0fea, 0x6d0123e9, 0xa90267fe, 0xa9035ff8};
+        void *o6 = nullptr, *o7 = nullptr;
+        int r6 = inline_hook((void *) (base + RVA_DAY_START), (void *) hook_DayStart, &o6, expDay1);
+        int r7 = inline_hook((void *) (base + RVA_DAY_ADS), (void *) hook_DayAds, &o7, expDay2);
+        if (r6 == 0) orig_DayStart = (MoveNextFn) o6;
+        if (r7 == 0) orig_DayAds = (MoveNextFn) o7;
+        char db[80];
+        snprintf(db, sizeof(db), "Gun hook: start=%d yenigun=%d (0=tamam)", r6, r7);
+        jlog(db);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
