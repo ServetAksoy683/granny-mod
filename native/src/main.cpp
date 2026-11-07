@@ -268,6 +268,9 @@ typedef void *(*StringNewFn)(const char *);
 typedef void (*LoadSceneFn)(void *name, const void *mi);
 static UpdateFn orig_EsUpdate = nullptr;
 static volatile int g_startReq = 0;
+static volatile int g_startSeed = 0;
+typedef void (*InitStateFn)(int seed, const void *mi);
+static const uintptr_t RVA_RANDOM_INIT = 0x2A953BC; // UnityEngine.Random.InitState(int)
 static const uintptr_t RVA_ES_UPDATE = 0x2D5E590;   // EventSystem.Update
 static const uintptr_t RVA_LOAD_SCENE = 0x2AAF058;  // SceneManager.LoadScene(string)
 
@@ -281,13 +284,21 @@ static void hook_EsUpdate(void *self, const void *mi) {
         jlog("sahne: il2cpp_string_new bulunamadi");
         return;
     }
+    int seed = g_startSeed;
+    if (seed != 0) {
+        ((InitStateFn) (g_base + RVA_RANDOM_INIT))(seed, nullptr);
+        char b[64];
+        snprintf(b, sizeof(b), "Rastgele tohum ayarlandi: %d", seed);
+        jlog(b);
+    }
     jlog("Sahne yukleniyor: Scene");
     void *nm = sn("Scene");
     ((LoadSceneFn) (g_base + RVA_LOAD_SCENE))(nm, nullptr);
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_dvloper_mod_Mod_nativeStartGame(JNIEnv *, jclass) {
+Java_com_dvloper_mod_Mod_nativeStartGame(JNIEnv *, jclass, jint seed) {
+    g_startSeed = seed;
     g_startReq = 1;
 }
 

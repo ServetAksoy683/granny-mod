@@ -55,6 +55,7 @@ public final class Mod {
     private static long lastUi;
     private static boolean nativeOk;
     private static volatile long lastLocalPos;
+    private static volatile int gameSeed;
     private static final Map<Integer, TextView> tags = new HashMap<Integer, TextView>();
 
     private static native void nativeSetRemote(int id, float x, float y, float z);
@@ -63,7 +64,7 @@ public final class Mod {
 
     private static native void nativeClearRemote();
 
-    private static native void nativeStartGame();
+    private static native void nativeStartGame(int seed);
 
     private Mod() {
     }
@@ -263,14 +264,10 @@ public final class Mod {
                     log("Sadece host oyunu başlatabilir");
                     return;
                 }
-                try {
-                    JSONObject o = new JSONObject();
-                    o.put("t", "start");
-                    n.sendText(o.toString());
-                } catch (Exception e) {
-                }
-                log("Oyun başlatılıyor (zorluk: menüdeki seçimin)");
-                nStart();
+                gameSeed = new java.util.Random().nextInt(900000) + 1;
+                sendStartMsg();
+                log("Oyun başlatılıyor (tohum " + gameSeed + ", zorluk: menüdeki seçimin)");
+                nStart(gameSeed);
             }
         });
         root.addView(start);
@@ -284,8 +281,11 @@ public final class Mod {
                     log("Önce bir odaya bağlan");
                     return;
                 }
+                if (gameSeed == 0) {
+                    log("Uyarı: host henüz MP ile başlatmadı, düzen eşleşmeyebilir");
+                }
                 log("Oyuna katılınıyor...");
-                nStart();
+                nStart(gameSeed);
             }
         });
         root.addView(joinGame);
@@ -440,18 +440,19 @@ public final class Mod {
         try {
             JSONObject o = new JSONObject();
             o.put("t", "start");
+            o.put("seed", gameSeed);
             n.sendText(o.toString());
         } catch (Exception e) {
         }
     }
 
-    private static void nStart() {
+    private static void nStart(int seed) {
         if (!nativeOk) {
             log("Native yüklü değil");
             return;
         }
         try {
-            nativeStartGame();
+            nativeStartGame(seed);
         } catch (Throwable t) {
             log("Başlatılamadı: " + t);
         }
@@ -471,7 +472,7 @@ public final class Mod {
                             .setMessage("Host oyunu başlattı. Katılmak ister misin?")
                             .setPositiveButton("Katıl", new DialogInterface.OnClickListener() {
                                 public void onClick(DialogInterface d, int w) {
-                                    nStart();
+                                    nStart(gameSeed);
                                 }
                             })
                             .setNegativeButton("İptal", null)
@@ -604,13 +605,14 @@ public final class Mod {
                 log("#" + id + " ayrıldı" + (hostId == myId ? " (artık HOST sensin)" : ""));
             } else if ("start".equals(t)) {
                 int from = o.optInt("from");
+                if (from == hostId) gameSeed = o.optInt("seed", 0);
                 log("Başlat mesajı geldi (gönderen #" + from + ", host #" + hostId + ")");
                 if (from == hostId) {
                     if (inGame()) {
                         log("Zaten oyundasın");
                     } else {
-                        log("Host oyunu başlattı, oyuna katılınıyor...");
-                        nStart();
+                        log("Host oyunu başlattı, oyuna katılınıyor... (tohum " + gameSeed + ")");
+                        nStart(gameSeed);
                     }
                 }
             } else if ("chat".equals(t)) {
