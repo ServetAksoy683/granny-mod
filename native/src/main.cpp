@@ -171,7 +171,7 @@ static void update_tags(const Vec3 &me, intptr_t pivotPtr) {
         float dx = snap[i].x - me.x, dy = snap[i].y - me.y, dz = snap[i].z - me.z;
         float dist = sqrtf(dx * dx + dy * dy + dz * dz);
         static int dbgCall = 0, dbgLogs = 0;
-        if (i == 0 && dbgLogs < 4 && (dbgCall++ % 75) == 0) {
+        if (i == 0 && dbgLogs < 0 && (dbgCall++ % 75) == 0) {
             dbgLogs++;
             char b[160];
             snprintf(b, sizeof(b), "etiket: kamera=%s sx=%.0f sy=%.0f sz=%.1f mesafe=%.1f",
@@ -269,6 +269,7 @@ typedef void (*LoadSceneFn)(void *name, const void *mi);
 static UpdateFn orig_EsUpdate = nullptr;
 static volatile int g_startReq = 0;
 static volatile int g_startSeed = 0;
+static volatile int g_gameSeed = 0;
 typedef void (*InitStateFn)(int seed, const void *mi);
 static const uintptr_t RVA_RANDOM_INIT = 0x2A953BC; // UnityEngine.Random.InitState(int)
 static const uintptr_t RVA_ES_UPDATE = 0x2D5E590;   // EventSystem.Update
@@ -299,7 +300,45 @@ static void hook_EsUpdate(void *self, const void *mi) {
 extern "C" JNIEXPORT void JNICALL
 Java_com_dvloper_mod_Mod_nativeStartGame(JNIEnv *, jclass, jint seed) {
     g_startSeed = seed;
+    g_gameSeed = seed;
     g_startReq = 1;
+}
+
+// --- Rastgele yerlesim: Start'tan hemen once tohumu yeniden ayarla ---
+static UpdateFn orig_KeyStart = nullptr;
+static UpdateFn orig_DunkStart = nullptr;
+static UpdateFn orig_KofotStart = nullptr;
+static const uintptr_t RVA_KEY_START = 0x1557328;    // RandomKeyPlace.Start
+static const uintptr_t RVA_DUNK_START = 0x1557298;   // RandomDunkPlace.Start
+static const uintptr_t RVA_KOFOT_START = 0x155739C;  // RandomKofotPlace.Start
+
+static void seed_before(int salt) {
+    int s = g_gameSeed;
+    if (s != 0) ((InitStateFn) (g_base + RVA_RANDOM_INIT))(s * 31 + salt, nullptr);
+}
+
+static void log_place(const char *what, int n) {
+    char b[80];
+    snprintf(b, sizeof(b), "yer: %s=%d (tohum %d)", what, n, (int) g_gameSeed);
+    jlog(b);
+}
+
+static void hook_KeyStart(void *self, const void *mi) {
+    seed_before(1);
+    orig_KeyStart(self, mi);
+    log_place("anahtar", *(int *) ((uintptr_t) self + 0x38));
+}
+
+static void hook_DunkStart(void *self, const void *mi) {
+    seed_before(2);
+    orig_DunkStart(self, mi);
+    log_place("dunk", *(int *) ((uintptr_t) self + 0x40));
+}
+
+static void hook_KofotStart(void *self, const void *mi) {
+    seed_before(3);
+    orig_KofotStart(self, mi);
+    log_place("kofot", *(int *) ((uintptr_t) self + 0x38));
 }
 
 static int phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
@@ -338,6 +377,18 @@ static void *init_thread(void *) {
         } else {
             jlog(r2 == 1 ? "EventSystem hook: imza uyusmuyor" : "EventSystem hook basarisiz");
         }
+        static const uint32_t expKey[4] = {0xa9bf4ffe, 0xaa0003f3, 0x52800020, 0x52800081};
+        static const uint32_t expDunk[4] = {0xa9bf4ffe, 0xaa0003f3, 0x52800020, 0x528000a1};
+        void *o3 = nullptr, *o4 = nullptr, *o5 = nullptr;
+        int r3 = inline_hook((void *) (base + RVA_KEY_START), (void *) hook_KeyStart, &o3, expKey);
+        int r4 = inline_hook((void *) (base + RVA_DUNK_START), (void *) hook_DunkStart, &o4, expDunk);
+        int r5 = inline_hook((void *) (base + RVA_KOFOT_START), (void *) hook_KofotStart, &o5, expKey);
+        if (r3 == 0) orig_KeyStart = (UpdateFn) o3;
+        if (r4 == 0) orig_DunkStart = (UpdateFn) o4;
+        if (r5 == 0) orig_KofotStart = (UpdateFn) o5;
+        char hb[80];
+        snprintf(hb, sizeof(hb), "Yerlesim hook: anahtar=%d dunk=%d kofot=%d (0=tamam)", r3, r4, r5);
+        jlog(hb);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {

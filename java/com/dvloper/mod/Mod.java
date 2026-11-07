@@ -350,7 +350,6 @@ public final class Mod {
 
             public void onText(String s) {
                 if (net == holder[0]) {
-                    log("gelen: " + (s.length() > 60 ? s.substring(0, 60) : s));
                     handleText(s);
                 }
             }
