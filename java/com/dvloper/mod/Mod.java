@@ -644,7 +644,7 @@ public final class Mod {
     private static void log(String s) {
         synchronized (logLines) {
             logLines.add(s);
-            while (logLines.size() > 16) logLines.remove(0);
+            while (logLines.size() > 70) logLines.remove(0);
         }
         UI.post(new Runnable() {
             public void run() {

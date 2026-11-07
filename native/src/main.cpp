@@ -398,6 +398,62 @@ static bool hook_DayAds(void *self, const void *mi) {
     return orig_DayAds(self, mi);
 }
 
+// --- PlayerPrefs.GetInt(string,int) gozlemi: hangi kayitli ayarlar okunuyor? ---
+typedef int (*PrefGetIntFn)(void *key, int def, const void *mi);
+static PrefGetIntFn orig_PrefGetInt = nullptr;
+static const uintptr_t RVA_PREF_GETINT = 0x2A945E8;
+
+struct PrefEnt {
+    char key[40];
+    int val;
+    bool used;
+};
+static PrefEnt g_prefs[64];
+
+static void il2str_ascii(void *s, char *out, int cap) {
+    if (!s) {
+        out[0] = 0;
+        return;
+    }
+    int len = *(int *) ((uintptr_t) s + 0x10);
+    const uint16_t *ch = (const uint16_t *) ((uintptr_t) s + 0x14);
+    int n = len < cap - 1 ? len : cap - 1;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) out[i] = ch[i] < 128 ? (char) ch[i] : '?';
+    out[n] = 0;
+}
+
+static int hook_PrefGetInt(void *key, int def, const void *mi) {
+    int r = orig_PrefGetInt(key, def, mi);
+    char k[40];
+    il2str_ascii(key, k, sizeof(k));
+    int slot = -1;
+    for (int i = 0; i < 64; i++) {
+        if (g_prefs[i].used && strcmp(g_prefs[i].key, k) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    char b[96];
+    if (slot < 0) {
+        for (int i = 0; i < 64; i++) {
+            if (!g_prefs[i].used) {
+                g_prefs[i].used = true;
+                strncpy(g_prefs[i].key, k, sizeof(g_prefs[i].key) - 1);
+                g_prefs[i].val = r;
+                snprintf(b, sizeof(b), "kayit: %s=%d", k, r);
+                jlog(b);
+                break;
+            }
+        }
+    } else if (g_prefs[slot].val != r) {
+        g_prefs[slot].val = r;
+        snprintf(b, sizeof(b), "kayit: %s=%d (degisti)", k, r);
+        jlog(b);
+    }
+    return r;
+}
+
 static int phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     if (info->dlpi_name && strstr(info->dlpi_name, "libil2cpp.so")) {
         *(uintptr_t *) data = (uintptr_t) info->dlpi_addr;
@@ -456,6 +512,13 @@ static void *init_thread(void *) {
         char db[80];
         snprintf(db, sizeof(db), "Gun hook: start=%d yenigun=%d (0=tamam)", r6, r7);
         jlog(db);
+        static const uint32_t expPref[4] = {0xd10143ff, 0xa90357fe, 0xa9044ff4, 0xf0003255};
+        void *o8 = nullptr;
+        int r8 = inline_hook((void *) (base + RVA_PREF_GETINT), (void *) hook_PrefGetInt, &o8, expPref);
+        if (r8 == 0) orig_PrefGetInt = (PrefGetIntFn) o8;
+        char pb[64];
+        snprintf(pb, sizeof(pb), "Kayit hook: %d (0=tamam)", r8);
+        jlog(pb);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
