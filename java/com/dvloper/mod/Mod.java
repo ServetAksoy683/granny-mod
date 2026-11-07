@@ -56,6 +56,7 @@ public final class Mod {
     private static boolean nativeOk;
     private static volatile long lastLocalPos;
     private static volatile int gameSeed;
+    private static volatile int gameNr = -1;
     private static final Map<Integer, TextView> tags = new HashMap<Integer, TextView>();
 
     private static native void nativeSetRemote(int id, float x, float y, float z);
@@ -64,7 +65,9 @@ public final class Mod {
 
     private static native void nativeClearRemote();
 
-    private static native void nativeStartGame(int seed);
+    private static native void nativeHostStart(int seed);
+
+    private static native void nativeJoinGame(int seed, int nr);
 
     private Mod() {
     }
@@ -265,9 +268,9 @@ public final class Mod {
                     return;
                 }
                 gameSeed = new java.util.Random().nextInt(900000) + 1;
-                sendStartMsg();
+                gameNr = -1;
                 log("Oyun başlatılıyor (tohum " + gameSeed + ", zorluk: menüdeki seçimin)");
-                nStart(gameSeed);
+                nHostStart(gameSeed);
             }
         });
         root.addView(start);
@@ -443,6 +446,7 @@ public final class Mod {
             JSONObject o = new JSONObject();
             o.put("t", "start");
             o.put("seed", gameSeed);
+            o.put("nr", gameNr);
             boolean ok = n.sendText(o.toString());
             log("başlat mesajı gönderildi: " + (ok ? "evet" : "HAYIR"));
         } catch (Exception e) {
@@ -456,10 +460,32 @@ public final class Mod {
             return;
         }
         try {
-            nativeStartGame(seed);
+            nativeJoinGame(seed, gameNr);
         } catch (Throwable t) {
             log("Başlatılamadı: " + t);
         }
+    }
+
+    /** Host: tohumu ve kayit degerini okutup herkese baslat mesaji gonderir. */
+    private static void nHostStart(int seed) {
+        if (!nativeOk) {
+            gameNr = -1;
+            sendStartMsg();
+            log("Native yüklü değil, kayıt değeri gönderilemedi");
+            return;
+        }
+        try {
+            nativeHostStart(seed);
+        } catch (Throwable t) {
+            log("Başlatılamadı: " + t);
+        }
+    }
+
+    /** Native taraftan cagrilir (oyun ana is parcacigi): host'un kayit degeri okundu. */
+    public static void onHostStartReady(int nr) {
+        gameNr = nr;
+        sendStartMsg();
+        log("Host kayıt değeri: randomNR=" + nr);
     }
 
     private static void promptStart() {
@@ -609,7 +635,10 @@ public final class Mod {
                 log("#" + id + " ayrıldı" + (hostId == myId ? " (artık HOST sensin)" : ""));
             } else if ("start".equals(t)) {
                 int from = o.optInt("from");
-                if (from == hostId) gameSeed = o.optInt("seed", 0);
+                if (from == hostId) {
+                    gameSeed = o.optInt("seed", 0);
+                    gameNr = o.optInt("nr", -1);
+                }
                 log("Başlat mesajı geldi (gönderen #" + from + ", host #" + hostId + ")");
                 if (from == hostId) {
                     if (inGame()) {

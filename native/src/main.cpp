@@ -294,6 +294,14 @@ typedef void *(*StringNewFn)(const char *);
 typedef void (*LoadSceneFn)(void *name, const void *mi);
 static UpdateFn orig_EsUpdate = nullptr;
 static volatile int g_startReq = 0;
+typedef int (*PrefGetIntFn)(void *key, int def, const void *mi);
+typedef void (*PrefSetIntFn)(void *key, int val, const void *mi);
+static PrefGetIntFn orig_PrefGetInt = nullptr;
+static const uintptr_t RVA_PREF_GETINT = 0x2A945E8;  // PlayerPrefs.GetInt(string,int)
+static const uintptr_t RVA_PREF_SETINT = 0x2A94590;  // PlayerPrefs.SetInt(string,int)
+static volatile int g_startAnnounce = 0;
+static volatile int g_hostNR = -1;
+static jmethodID g_onHostStart = nullptr;
 static volatile int g_startSeed = 0;
 static volatile int g_gameSeed = 0;
 typedef void (*InitStateFn)(int seed, const void *mi);
@@ -311,6 +319,24 @@ static void hook_EsUpdate(void *self, const void *mi) {
         jlog("sahne: il2cpp_string_new bulunamadi");
         return;
     }
+    {
+        void *key = sn("randomNR");
+        if (g_startAnnounce) {
+            g_startAnnounce = 0;
+            PrefGetIntFn getter = orig_PrefGetInt ? orig_PrefGetInt : (PrefGetIntFn) (g_base + RVA_PREF_GETINT);
+            int nr = getter(key, 0, nullptr);
+            JNIEnv *env = env_for_thread();
+            if (env && g_modClass && g_onHostStart) {
+                env->CallStaticVoidMethod(g_modClass, g_onHostStart, (jint) nr);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+        } else if (g_hostNR >= 0) {
+            ((PrefSetIntFn) (g_base + RVA_PREF_SETINT))(key, g_hostNR, nullptr);
+            char b[64];
+            snprintf(b, sizeof(b), "kayit ayarlandi: randomNR=%d", (int) g_hostNR);
+            jlog(b);
+        }
+    }
     int seed = g_startSeed;
     if (seed != 0) {
         ((InitStateFn) (g_base + RVA_RANDOM_INIT))(seed, nullptr);
@@ -324,9 +350,20 @@ static void hook_EsUpdate(void *self, const void *mi) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_dvloper_mod_Mod_nativeStartGame(JNIEnv *, jclass, jint seed) {
+Java_com_dvloper_mod_Mod_nativeHostStart(JNIEnv *, jclass, jint seed) {
     g_startSeed = seed;
     g_gameSeed = seed;
+    g_hostNR = -1;
+    g_startAnnounce = 1;
+    g_startReq = 1;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeJoinGame(JNIEnv *, jclass, jint seed, jint nr) {
+    g_startSeed = seed;
+    g_gameSeed = seed;
+    g_hostNR = nr;
+    g_startAnnounce = 0;
     g_startReq = 1;
 }
 
@@ -399,10 +436,6 @@ static bool hook_DayAds(void *self, const void *mi) {
 }
 
 // --- PlayerPrefs.GetInt(string,int) gozlemi: hangi kayitli ayarlar okunuyor? ---
-typedef int (*PrefGetIntFn)(void *key, int def, const void *mi);
-static PrefGetIntFn orig_PrefGetInt = nullptr;
-static const uintptr_t RVA_PREF_GETINT = 0x2A945E8;
-
 struct PrefEnt {
     char key[40];
     int val;
@@ -542,6 +575,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     g_onPos = env->GetStaticMethodID(c, "onLocalPos", "(FFFF)V");
     g_onLog = env->GetStaticMethodID(c, "nativeLog", "(Ljava/lang/String;)V");
     g_onTag = env->GetStaticMethodID(c, "onRemoteScreen", "(IFFFFFF)V");
+    g_onHostStart = env->GetStaticMethodID(c, "onHostStartReady", "(I)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     pthread_t t;
     pthread_create(&t, nullptr, init_thread, nullptr);
