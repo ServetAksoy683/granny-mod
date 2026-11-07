@@ -54,6 +54,7 @@ public final class Mod {
     private static final Map<Integer, float[]> remote = new TreeMap<Integer, float[]>();
     private static long lastUi;
     private static boolean nativeOk;
+    private static volatile long lastLocalPos;
     private static final Map<Integer, TextView> tags = new HashMap<Integer, TextView>();
 
     private static native void nativeSetRemote(int id, float x, float y, float z);
@@ -274,6 +275,21 @@ public final class Mod {
         });
         root.addView(start);
 
+        Button joinGame = new Button(a);
+        joinGame.setText("Oyuna katıl");
+        joinGame.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                Net n = net;
+                if (n == null || !n.isOpen() || myId <= 0) {
+                    log("Önce bir odaya bağlan");
+                    return;
+                }
+                log("Oyuna katılınıyor...");
+                nStart();
+            }
+        });
+        root.addView(joinGame);
+
         Button test = new Button(a);
         test.setText("Test mesajı gönder");
         test.setOnClickListener(new View.OnClickListener() {
@@ -364,6 +380,7 @@ public final class Mod {
 
     /** Native taraftan cagrilir (oyun ana is parcacigi, ~10 Hz). */
     public static void onLocalPos(float x, float y, float z, float yaw) {
+        lastLocalPos = System.currentTimeMillis();
         Net n = net;
         if (n == null || !n.isOpen() || myId <= 0) return;
         ByteBuffer bb = ByteBuffer.allocate(17);
@@ -409,6 +426,22 @@ public final class Mod {
         try {
             nativeRemoveRemote(id);
         } catch (Throwable t) {
+        }
+    }
+
+    /** Oyun sahnesinde miyiz? (konum hook'u son 3 sn icinde calistiysa evet) */
+    private static boolean inGame() {
+        return System.currentTimeMillis() - lastLocalPos < 3000;
+    }
+
+    private static void sendStartMsg() {
+        Net n = net;
+        if (n == null || !n.isOpen()) return;
+        try {
+            JSONObject o = new JSONObject();
+            o.put("t", "start");
+            n.sendText(o.toString());
+        } catch (Exception e) {
         }
     }
 
@@ -553,6 +586,10 @@ public final class Mod {
                     players.put(id, nm);
                 }
                 log("#" + id + " " + nm + " katıldı");
+                if (myId > 0 && myId == hostId && inGame()) {
+                    sendStartMsg();
+                    log("Yeni oyuncuya oyun daveti gönderildi");
+                }
             } else if ("leave".equals(t)) {
                 int id = o.getInt("id");
                 synchronized (players) {
@@ -569,8 +606,12 @@ public final class Mod {
                 int from = o.optInt("from");
                 log("Başlat mesajı geldi (gönderen #" + from + ", host #" + hostId + ")");
                 if (from == hostId) {
-                    log("Host oyunu başlattı, oyuna katılınıyor...");
-                    nStart();
+                    if (inGame()) {
+                        log("Zaten oyundasın");
+                    } else {
+                        log("Host oyunu başlattı, oyuna katılınıyor...");
+                        nStart();
+                    }
                 }
             } else if ("chat".equals(t)) {
                 log("#" + o.optInt("from") + ": " + o.optString("m"));
