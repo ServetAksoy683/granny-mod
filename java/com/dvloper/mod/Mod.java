@@ -349,7 +349,10 @@ public final class Mod {
             }
 
             public void onText(String s) {
-                if (net == holder[0]) handleText(s);
+                if (net == holder[0]) {
+                    log("gelen: " + (s.length() > 60 ? s.substring(0, 60) : s));
+                    handleText(s);
+                }
             }
 
             public void onBinary(byte[] b) {
@@ -441,8 +444,10 @@ public final class Mod {
             JSONObject o = new JSONObject();
             o.put("t", "start");
             o.put("seed", gameSeed);
-            n.sendText(o.toString());
+            boolean ok = n.sendText(o.toString());
+            log("başlat mesajı gönderildi: " + (ok ? "evet" : "HAYIR"));
         } catch (Exception e) {
+            log("başlat mesajı hatası: " + e);
         }
     }
 
