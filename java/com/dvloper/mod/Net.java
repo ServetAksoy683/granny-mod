@@ -10,6 +10,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.security.SecureRandom;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLSocket;
@@ -28,6 +31,15 @@ public final class Net {
     private final Listener l;
     private final SecureRandom rnd = new SecureRandom();
     private final Object wlock = new Object();
+    // Android ana (UI) is parcaciginda soket yazmak yasak (NetworkOnMainThreadException),
+    // bu yuzden tum gonderimler tek bir arka plan is parcaciginda yapilir.
+    private final ExecutorService tx = Executors.newSingleThreadExecutor(new ThreadFactory() {
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "mod-net-tx");
+            t.setDaemon(true);
+            return t;
+        }
+    });
     private volatile Socket sock;
     private volatile OutputStream out;
     private volatile boolean open;
@@ -52,14 +64,31 @@ public final class Net {
 
     public boolean sendText(String s) {
         try {
-            return sendFrame(1, s.getBytes("UTF-8"));
+            return submit(1, s.getBytes("UTF-8"));
         } catch (Exception e) {
             return false;
         }
     }
 
     public boolean sendBinary(byte[] b) {
-        return sendFrame(2, b);
+        return submit(2, b);
+    }
+
+    private boolean submit(final int op, final byte[] b) {
+        if (!open) return false;
+        try {
+            tx.execute(new Runnable() {
+                public void run() {
+                    try {
+                        sendFrame(op, b);
+                    } catch (Throwable t) {
+                    }
+                }
+            });
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public void close() {
@@ -170,6 +199,10 @@ public final class Net {
             why = (m != null && m.length() > 0) ? m : e.getClass().getSimpleName();
         } finally {
             open = false;
+            try {
+                tx.shutdown();
+            } catch (Exception e) {
+            }
             try {
                 if (s != null) s.close();
             } catch (Exception e) {
