@@ -325,7 +325,7 @@ public final class Mod {
     }
 
     private static void connect(String path) {
-        if (net != null) net.close();
+        final Net old = net;
         final Net[] holder = new Net[1];
         Net n = new Net(new Net.Listener() {
             public void onOpen() {
@@ -357,6 +357,7 @@ public final class Mod {
         });
         holder[0] = n;
         net = n;
+        if (old != null) old.close();
         log("Bağlanıyor...");
         n.connect(HOST, path);
     }
@@ -567,7 +568,10 @@ public final class Mod {
             } else if ("start".equals(t)) {
                 int from = o.optInt("from");
                 log("Başlat mesajı geldi (gönderen #" + from + ", host #" + hostId + ")");
-                if (from == hostId) promptStart();
+                if (from == hostId) {
+                    log("Host oyunu başlattı, oyuna katılınıyor...");
+                    nStart();
+                }
             } else if ("chat".equals(t)) {
                 log("#" + o.optInt("from") + ": " + o.optString("m"));
             }
