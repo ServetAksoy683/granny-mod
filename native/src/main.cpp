@@ -304,6 +304,10 @@ static volatile int g_hostNR = -1;
 static jmethodID g_onHostStart = nullptr;
 static jmethodID g_onGranny = nullptr;
 static volatile int g_gHave = 0;
+static volatile int g_blockGranny = 0;       // olum/yeni gun sirasinda Granny'yi isinlama
+static intptr_t g_grannyCached = 0;          // Granny transform (yerel isaretci)
+static void *g_grannySelf = nullptr;         // EnemyAIGranny ornegi
+static jmethodID g_onGrannyAnim = nullptr;
 static volatile int g_startSeed = 0;
 static volatile int g_gameSeed = 0;
 typedef void (*InitStateFn)(int seed, const void *mi);
@@ -416,6 +420,9 @@ static const uintptr_t RVA_DAY_START = 0x154F254;  // StartNewDay.<Start>d__132.
 static const uintptr_t RVA_DAY_ADS = 0x1550B38;    // StartNewDay.<newDayAfterADS>d__142.MoveNext
 static int g_dayLogs = 0;
 
+static volatile int g_role = 0; // 0 = tek kisilik, 1 = host, 2 = istemci
+static bool g_role_for_block() { return g_role != 0; }
+
 static void day_seed(void *self, int salt, const char *name) {
     int st = *(int *) ((uintptr_t) self + 0x10); // <>1__state
     int seed = g_gameSeed;
@@ -436,7 +443,11 @@ static bool hook_DayStart(void *self, const void *mi) {
 
 static bool hook_DayAds(void *self, const void *mi) {
     day_seed(self, 11, "YeniGun");
-    return orig_DayAds(self, mi);
+    bool blk = g_role_for_block();
+    if (blk) g_blockGranny = 1;
+    bool r = orig_DayAds(self, mi);
+    g_blockGranny = 0;
+    return r;
 }
 
 // --- PlayerPrefs.GetInt(string,int) gozlemi: hangi kayitli ayarlar okunuyor? ---
@@ -491,34 +502,188 @@ static int hook_PrefGetInt(void *key, int def, const void *mi) {
     return r;
 }
 
-// --- Granny senkronu: host'ta AI calisir ve konumu yayilir, istemcide AI kapatilir ---
+// --- Granny senkronu: host'ta AI calisir ve konumu/animasyonu yayilir, istemcide AI kapatilir ---
 typedef void (*SetVecFn)(intptr_t self, const Vec3 *v, const void *mi);
 typedef void (*SetQuatFn)(intptr_t self, const Quat *q, const void *mi);
 typedef void (*SetEnabledFn)(void *self, bool v, const void *mi);
+typedef void (*CrossFadeFn)(void *self, void *name, float fade, int mode, const void *mi);
+typedef bool (*PlayFn)(void *self, void *name, int mode, const void *mi);
+typedef void *(*GetGoFn)(void *comp, const void *mi);
+typedef void *(*GetCompStrFn)(void *go, void *typeStr, const void *mi);
 static UpdateFn orig_GrannyFixed = nullptr;
-static const uintptr_t RVA_GRANNY_FIXED = 0x14549E4;   // EnemyAIGranny.FixedUpdate
-static const uintptr_t RVA_SET_POS = 0x2AA91EC;        // Transform.set_position_Injected
-static const uintptr_t RVA_SET_ROT = 0x2AA988C;        // Transform.set_rotation_Injected
+static CrossFadeFn orig_CrossFade = nullptr;
+static PlayFn orig_Play = nullptr;
+static SetVecFn orig_SetPos = nullptr;
+static MoveNextFn orig_CaughtMove = nullptr;
+static const uintptr_t RVA_GRANNY_FIXED = 0x14549E4;    // EnemyAIGranny.FixedUpdate
+static const uintptr_t RVA_SET_POS = 0x2AA91EC;         // Transform.set_position_Injected
+static const uintptr_t RVA_SET_ROT = 0x2AA988C;         // Transform.set_rotation_Injected
 static const uintptr_t RVA_BEH_SET_ENABLED = 0x2A99DB4; // Behaviour.set_enabled
-static const uintptr_t OFF_GRANNY_TRANSFORM = 0x28;    // EnemyAIGranny.myTransform
-static const uintptr_t OFF_GRANNY_NAV = 0x108;         // EnemyAIGranny.navComponent
-static volatile int g_role = 0; // 0 = tek kisilik, 1 = host, 2 = istemci
+static const uintptr_t RVA_CROSSFADE3 = 0x2A607BC;      // Animation.CrossFade(string,float,PlayMode)
+static const uintptr_t RVA_PLAY2 = 0x2A60594;           // Animation.Play(string,PlayMode)
+static const uintptr_t RVA_CAUGHT_MOVE = 0x145C658;     // EnemyAIGranny.<Playercaught>.MoveNext
+static const uintptr_t RVA_GET_GAMEOBJECT = 0x2A9A678;  // Component.get_gameObject
+static const uintptr_t RVA_GO_GETCOMP_STR = 0x2A9D5C8;  // GameObject.GetComponent(string)
+static const uintptr_t OFF_GRANNY_TRANSFORM = 0x28;     // EnemyAIGranny.myTransform
+static const uintptr_t OFF_GRANNY_NAV = 0x108;          // EnemyAIGranny.navComponent
+static const uintptr_t OFF_GRANNY_ANIMHOLDER = 0x1D8;   // EnemyAIGranny.animationHolder
 static float g_gx = 0, g_gy = 0, g_gz = 0, g_gyaw = 0;
 static int g_gTick = 0;
 static void *g_navFor = nullptr;
 
+static void *il2_str(const char *s) {
+    static StringNewFn sn = nullptr;
+    if (!sn) {
+        void *h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+        if (h) sn = (StringNewFn) dlsym(h, "il2cpp_string_new");
+    }
+    return sn ? sn(s) : nullptr;
+}
+
+// Animasyon olaylari kuyrugu (Java -> ana is parcacigi)
+struct AnimEv {
+    char name[48];
+    float fade;
+};
+static AnimEv g_animQ[8];
+static int g_animHead = 0, g_animTail = 0;
+static pthread_mutex_t g_animMx = PTHREAD_MUTEX_INITIALIZER;
+
+static void anim_push(const char *n, float f) {
+    pthread_mutex_lock(&g_animMx);
+    int next = (g_animHead + 1) % 8;
+    if (next != g_animTail) {
+        strncpy(g_animQ[g_animHead].name, n, 47);
+        g_animQ[g_animHead].name[47] = 0;
+        g_animQ[g_animHead].fade = f;
+        g_animHead = next;
+    }
+    pthread_mutex_unlock(&g_animMx);
+}
+
+static bool anim_pop(AnimEv *out) {
+    pthread_mutex_lock(&g_animMx);
+    bool ok = g_animTail != g_animHead;
+    if (ok) {
+        *out = g_animQ[g_animTail];
+        g_animTail = (g_animTail + 1) % 8;
+    }
+    pthread_mutex_unlock(&g_animMx);
+    return ok;
+}
+
+static bool is_granny_anim(void *anim) {
+    if (!g_grannySelf || !anim) return false;
+    GetGoFn getGo = (GetGoFn) (g_base + RVA_GET_GAMEOBJECT);
+    void *go = getGo(anim, nullptr);
+    if (!go) return false;
+    void *holder = *(void **) ((uintptr_t) g_grannySelf + OFF_GRANNY_ANIMHOLDER);
+    if (holder && go == holder) return true;
+    return go == getGo(g_grannySelf, nullptr);
+}
+
+static int g_animLogs = 0, g_animMiss = 0;
+
+static void forward_anim(void *anim, void *nameStr, float fade) {
+    if (g_role != 1) return;
+    char nm[48];
+    il2str_ascii(nameStr, nm, sizeof(nm));
+    char b[96];
+    if (!is_granny_anim(anim)) {
+        if (g_animMiss < 3) {
+            g_animMiss++;
+            snprintf(b, sizeof(b), "anim? (granny degil): %s", nm);
+            jlog(b);
+        }
+        return;
+    }
+    if (g_animLogs < 6) {
+        g_animLogs++;
+        snprintf(b, sizeof(b), "granny anim: %s (%.2f)", nm, fade);
+        jlog(b);
+    }
+    JNIEnv *env = env_for_thread();
+    if (!env || !g_modClass || !g_onGrannyAnim) return;
+    jstring js = env->NewStringUTF(nm);
+    env->CallStaticVoidMethod(g_modClass, g_onGrannyAnim, js, fade);
+    env->DeleteLocalRef(js);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+static void hook_CrossFade(void *self, void *name, float fade, int mode, const void *mi) {
+    orig_CrossFade(self, name, fade, mode, mi);
+    forward_anim(self, name, fade);
+}
+
+static bool hook_Play(void *self, void *name, int mode, const void *mi) {
+    bool r = orig_Play(self, name, mode, mi);
+    forward_anim(self, name, -1.0f);
+    return r;
+}
+
+static void hook_SetPos(intptr_t self, const Vec3 *v, const void *mi) {
+    if (g_blockGranny && g_grannyCached && self == g_grannyCached) {
+        static int blocked = 0;
+        if (blocked < 6) {
+            blocked++;
+            jlog("Granny isinlanmasi engellendi");
+        }
+        return;
+    }
+    if (orig_SetPos) orig_SetPos(self, v, mi);
+}
+
+static bool hook_CaughtMove(void *self, const void *mi) {
+    if (g_role != 0) g_blockGranny = 1;
+    bool r = orig_CaughtMove(self, mi);
+    g_blockGranny = 0;
+    return r;
+}
+
+static void *g_animComp = nullptr;
+static void *g_animCompFor = nullptr;
+
+static void client_apply_anims(void *self) {
+    AnimEv ev;
+    while (anim_pop(&ev)) {
+        if (g_animCompFor != self) {
+            g_animCompFor = self;
+            g_animComp = nullptr;
+            void *tname = il2_str("Animation");
+            GetCompStrFn gc = (GetCompStrFn) (g_base + RVA_GO_GETCOMP_STR);
+            void *holder = *(void **) ((uintptr_t) self + OFF_GRANNY_ANIMHOLDER);
+            if (holder && tname) g_animComp = gc(holder, tname, nullptr);
+            if (!g_animComp && tname) {
+                void *go = ((GetGoFn) (g_base + RVA_GET_GAMEOBJECT))(self, nullptr);
+                if (go) g_animComp = gc(go, tname, nullptr);
+            }
+            jlog(g_animComp ? "Granny animasyon bileseni bulundu" : "Granny animasyon bileseni YOK");
+        }
+        if (!g_animComp) continue;
+        void *nm = il2_str(ev.name);
+        if (!nm) continue;
+        if (ev.fade < 0) {
+            if (orig_Play) orig_Play(g_animComp, nm, 0, nullptr);
+        } else if (orig_CrossFade) {
+            orig_CrossFade(g_animComp, nm, ev.fade, 0, nullptr);
+        }
+    }
+}
+
 static void hook_GrannyFixed(void *self, const void *mi) {
+    if (self) {
+        g_grannySelf = self;
+        void *tr0 = *(void **) ((uintptr_t) self + OFF_GRANNY_TRANSFORM);
+        if (tr0) g_grannyCached = *(intptr_t *) ((uintptr_t) tr0 + OFF_CACHED_PTR);
+    }
     if (g_role != 2) {
         orig_GrannyFixed(self, mi);
         if (g_role == 1 && self && (++g_gTick % 5) == 0) {
-            void *tr = *(void **) ((uintptr_t) self + OFF_GRANNY_TRANSFORM);
-            if (!tr) return;
-            intptr_t cached = *(intptr_t *) ((uintptr_t) tr + OFF_CACHED_PTR);
-            if (!cached) return;
+            if (!g_grannyCached) return;
             Vec3 p = {0, 0, 0};
             Quat q = {0, 0, 0, 1};
-            ((GetVec3Fn) (g_base + RVA_GET_POS))(cached, &p, nullptr);
-            ((GetQuatFn) (g_base + RVA_GET_ROT))(cached, &q, nullptr);
+            ((GetVec3Fn) (g_base + RVA_GET_POS))(g_grannyCached, &p, nullptr);
+            ((GetQuatFn) (g_base + RVA_GET_ROT))(g_grannyCached, &q, nullptr);
             float yaw = atan2f(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.x * q.x)) * 57.29578f;
             JNIEnv *env = env_for_thread();
             if (env && g_modClass && g_onGranny) {
@@ -528,7 +693,7 @@ static void hook_GrannyFixed(void *self, const void *mi) {
         }
         return;
     }
-    // Istemci: yapay zekayi calistirma, host'tan gelen konumu uygula
+    // Istemci: yapay zekayi calistirma, host'tan gelen konumu ve animasyonlari uygula
     if (!self) return;
     if (g_navFor != self) {
         g_navFor = self;
@@ -538,16 +703,14 @@ static void hook_GrannyFixed(void *self, const void *mi) {
             jlog("Granny: istemci modu (yol bulma kapatildi)");
         }
     }
-    if (!g_gHave) return;
-    void *tr = *(void **) ((uintptr_t) self + OFF_GRANNY_TRANSFORM);
-    if (!tr) return;
-    intptr_t cached = *(intptr_t *) ((uintptr_t) tr + OFF_CACHED_PTR);
-    if (!cached) return;
+    client_apply_anims(self);
+    if (!g_gHave || !g_grannyCached) return;
     Vec3 p = {g_gx, g_gy, g_gz};
     float h = g_gyaw * 0.01745329f * 0.5f;
     Quat q = {0, sinf(h), 0, cosf(h)};
-    ((SetVecFn) (g_base + RVA_SET_POS))(cached, &p, nullptr);
-    ((SetQuatFn) (g_base + RVA_SET_ROT))(cached, &q, nullptr);
+    SetVecFn sp = orig_SetPos ? orig_SetPos : (SetVecFn) (g_base + RVA_SET_POS);
+    sp(g_grannyCached, &p, nullptr);
+    ((SetQuatFn) (g_base + RVA_SET_ROT))(g_grannyCached, &q, nullptr);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -563,6 +726,16 @@ Java_com_dvloper_mod_Mod_nativeSetGranny(JNIEnv *, jclass, jfloat x, jfloat y, j
     g_gz = z;
     g_gyaw = yaw;
     g_gHave = 1;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeGrannyAnim(JNIEnv *env, jclass, jstring name, jfloat fade) {
+    if (!name) return;
+    const char *c = env->GetStringUTFChars(name, nullptr);
+    if (c) {
+        anim_push(c, fade);
+        env->ReleaseStringUTFChars(name, c);
+    }
 }
 
 static int phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
@@ -637,6 +810,22 @@ static void *init_thread(void *) {
         char gb[64];
         snprintf(gb, sizeof(gb), "Granny hook: %d (0=tamam)", r9);
         jlog(gb);
+        static const uint32_t expCf[4] = {0xd10183ff, 0xfd001be8, 0xf9001ffe, 0xa90457f6};
+        static const uint32_t expPl[4] = {0xd10183ff, 0xf9001bfe, 0xa90457f6, 0xa9054ff4};
+        static const uint32_t expSp[4] = {0xa9be57fe, 0xa9014ff4, 0xf00031b5, 0xaa0103f3};
+        static const uint32_t expCt[4] = {0xfc1b0fea, 0x6d00a3e9, 0xf9000ffe, 0xa9025ff8};
+        void *oa = nullptr, *ob = nullptr, *oc = nullptr, *od = nullptr;
+        int ra = inline_hook((void *) (base + RVA_CROSSFADE3), (void *) hook_CrossFade, &oa, expCf);
+        int rb = inline_hook((void *) (base + RVA_PLAY2), (void *) hook_Play, &ob, expPl);
+        int rc = inline_hook((void *) (base + RVA_SET_POS), (void *) hook_SetPos, &oc, expSp);
+        int rd = inline_hook((void *) (base + RVA_CAUGHT_MOVE), (void *) hook_CaughtMove, &od, expCt);
+        if (ra == 0) orig_CrossFade = (CrossFadeFn) oa;
+        if (rb == 0) orig_Play = (PlayFn) ob;
+        if (rc == 0) orig_SetPos = (SetVecFn) oc;
+        if (rd == 0) orig_CaughtMove = (MoveNextFn) od;
+        char ab[96];
+        snprintf(ab, sizeof(ab), "Animasyon hook: cf=%d play=%d setpos=%d yakalandi=%d (0=tamam)", ra, rb, rc, rd);
+        jlog(ab);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
@@ -662,6 +851,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     g_onTag = env->GetStaticMethodID(c, "onRemoteScreen", "(IFFFFFF)V");
     g_onHostStart = env->GetStaticMethodID(c, "onHostStartReady", "(I)V");
     g_onGranny = env->GetStaticMethodID(c, "onGrannyLocal", "(FFFF)V");
+    g_onGrannyAnim = env->GetStaticMethodID(c, "onGrannyAnim", "(Ljava/lang/String;F)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     pthread_t t;
     pthread_create(&t, nullptr, init_thread, nullptr);
