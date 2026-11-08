@@ -302,6 +302,7 @@ static const uintptr_t RVA_PREF_SETINT = 0x2A94590;  // PlayerPrefs.SetInt(strin
 static volatile int g_startAnnounce = 0;
 static volatile int g_hostNR = -1;
 static jmethodID g_onHostStart = nullptr;
+static jmethodID g_onGranny = nullptr;
 static volatile int g_startSeed = 0;
 static volatile int g_gameSeed = 0;
 typedef void (*InitStateFn)(int seed, const void *mi);
@@ -354,6 +355,7 @@ Java_com_dvloper_mod_Mod_nativeHostStart(JNIEnv *, jclass, jint seed) {
     g_startSeed = seed;
     g_gameSeed = seed;
     g_hostNR = -1;
+    g_gHave = 0;
     g_startAnnounce = 1;
     g_startReq = 1;
 }
@@ -363,6 +365,7 @@ Java_com_dvloper_mod_Mod_nativeJoinGame(JNIEnv *, jclass, jint seed, jint nr) {
     g_startSeed = seed;
     g_gameSeed = seed;
     g_hostNR = nr;
+    g_gHave = 0;
     g_startAnnounce = 0;
     g_startReq = 1;
 }
@@ -487,6 +490,81 @@ static int hook_PrefGetInt(void *key, int def, const void *mi) {
     return r;
 }
 
+// --- Granny senkronu: host'ta AI calisir ve konumu yayilir, istemcide AI kapatilir ---
+typedef void (*SetVecFn)(intptr_t self, const Vec3 *v, const void *mi);
+typedef void (*SetQuatFn)(intptr_t self, const Quat *q, const void *mi);
+typedef void (*SetEnabledFn)(void *self, bool v, const void *mi);
+static UpdateFn orig_GrannyFixed = nullptr;
+static const uintptr_t RVA_GRANNY_FIXED = 0x14549E4;   // EnemyAIGranny.FixedUpdate
+static const uintptr_t RVA_SET_POS = 0x2AA91EC;        // Transform.set_position_Injected
+static const uintptr_t RVA_SET_ROT = 0x2AA988C;        // Transform.set_rotation_Injected
+static const uintptr_t RVA_BEH_SET_ENABLED = 0x2A99DB4; // Behaviour.set_enabled
+static const uintptr_t OFF_GRANNY_TRANSFORM = 0x28;    // EnemyAIGranny.myTransform
+static const uintptr_t OFF_GRANNY_NAV = 0x108;         // EnemyAIGranny.navComponent
+static volatile int g_role = 0; // 0 = tek kisilik, 1 = host, 2 = istemci
+static volatile int g_gHave = 0;
+static float g_gx = 0, g_gy = 0, g_gz = 0, g_gyaw = 0;
+static int g_gTick = 0;
+static void *g_navFor = nullptr;
+
+static void hook_GrannyFixed(void *self, const void *mi) {
+    if (g_role != 2) {
+        orig_GrannyFixed(self, mi);
+        if (g_role == 1 && self && (++g_gTick % 5) == 0) {
+            void *tr = *(void **) ((uintptr_t) self + OFF_GRANNY_TRANSFORM);
+            if (!tr) return;
+            intptr_t cached = *(intptr_t *) ((uintptr_t) tr + OFF_CACHED_PTR);
+            if (!cached) return;
+            Vec3 p = {0, 0, 0};
+            Quat q = {0, 0, 0, 1};
+            ((GetVec3Fn) (g_base + RVA_GET_POS))(cached, &p, nullptr);
+            ((GetQuatFn) (g_base + RVA_GET_ROT))(cached, &q, nullptr);
+            float yaw = atan2f(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.x * q.x)) * 57.29578f;
+            JNIEnv *env = env_for_thread();
+            if (env && g_modClass && g_onGranny) {
+                env->CallStaticVoidMethod(g_modClass, g_onGranny, p.x, p.y, p.z, yaw);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+        }
+        return;
+    }
+    // Istemci: yapay zekayi calistirma, host'tan gelen konumu uygula
+    if (!self) return;
+    if (g_navFor != self) {
+        g_navFor = self;
+        void *nav = *(void **) ((uintptr_t) self + OFF_GRANNY_NAV);
+        if (nav) {
+            ((SetEnabledFn) (g_base + RVA_BEH_SET_ENABLED))(nav, false, nullptr);
+            jlog("Granny: istemci modu (yol bulma kapatildi)");
+        }
+    }
+    if (!g_gHave) return;
+    void *tr = *(void **) ((uintptr_t) self + OFF_GRANNY_TRANSFORM);
+    if (!tr) return;
+    intptr_t cached = *(intptr_t *) ((uintptr_t) tr + OFF_CACHED_PTR);
+    if (!cached) return;
+    Vec3 p = {g_gx, g_gy, g_gz};
+    float h = g_gyaw * 0.01745329f * 0.5f;
+    Quat q = {0, sinf(h), 0, cosf(h)};
+    ((SetVecFn) (g_base + RVA_SET_POS))(cached, &p, nullptr);
+    ((SetQuatFn) (g_base + RVA_SET_ROT))(cached, &q, nullptr);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeSetRole(JNIEnv *, jclass, jint role) {
+    g_role = role;
+    if (role != 2) g_navFor = nullptr;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeSetGranny(JNIEnv *, jclass, jfloat x, jfloat y, jfloat z, jfloat yaw) {
+    g_gx = x;
+    g_gy = y;
+    g_gz = z;
+    g_gyaw = yaw;
+    g_gHave = 1;
+}
+
 static int phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     if (info->dlpi_name && strstr(info->dlpi_name, "libil2cpp.so")) {
         *(uintptr_t *) data = (uintptr_t) info->dlpi_addr;
@@ -552,6 +630,13 @@ static void *init_thread(void *) {
         char pb[64];
         snprintf(pb, sizeof(pb), "Kayit hook: %d (0=tamam)", r8);
         jlog(pb);
+        static const uint32_t expGr[4] = {0xd10303ff, 0x6d033bef, 0x6d0433ed, 0x6d052beb};
+        void *o9 = nullptr;
+        int r9 = inline_hook((void *) (base + RVA_GRANNY_FIXED), (void *) hook_GrannyFixed, &o9, expGr);
+        if (r9 == 0) orig_GrannyFixed = (UpdateFn) o9;
+        char gb[64];
+        snprintf(gb, sizeof(gb), "Granny hook: %d (0=tamam)", r9);
+        jlog(gb);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
@@ -576,6 +661,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     g_onLog = env->GetStaticMethodID(c, "nativeLog", "(Ljava/lang/String;)V");
     g_onTag = env->GetStaticMethodID(c, "onRemoteScreen", "(IFFFFFF)V");
     g_onHostStart = env->GetStaticMethodID(c, "onHostStartReady", "(I)V");
+    g_onGranny = env->GetStaticMethodID(c, "onGrannyLocal", "(FFFF)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     pthread_t t;
     pthread_create(&t, nullptr, init_thread, nullptr);

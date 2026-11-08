@@ -57,6 +57,7 @@ public final class Mod {
     private static volatile long lastLocalPos;
     private static volatile int gameSeed;
     private static volatile int gameNr = -1;
+    private static volatile boolean mpActive;
     private static final Map<Integer, TextView> tags = new HashMap<Integer, TextView>();
 
     private static native void nativeSetRemote(int id, float x, float y, float z);
@@ -68,6 +69,10 @@ public final class Mod {
     private static native void nativeHostStart(int seed);
 
     private static native void nativeJoinGame(int seed, int nr);
+
+    private static native void nativeSetRole(int role);
+
+    private static native void nativeSetGranny(float x, float y, float z, float yaw);
 
     private Mod() {
     }
@@ -372,6 +377,8 @@ public final class Mod {
                 nClear();
                 clearTags();
                 myId = 0;
+                mpActive = false;
+                updateRole();
                 roomCode = "";
                 log("Bağlantı kapandı: " + why);
             }
@@ -399,6 +406,13 @@ public final class Mod {
     }
 
     private static void handleBinary(byte[] b) {
+        if (b.length >= 18 && b[1] == 2) {
+            if ((b[0] & 0xFF) == hostId) {
+                ByteBuffer gb = ByteBuffer.wrap(b, 2, 16);
+                nGranny(gb.getFloat(), gb.getFloat(), gb.getFloat(), gb.getFloat());
+            }
+            return;
+        }
         if (b.length >= 18 && b[1] == 1) {
             ByteBuffer bb = ByteBuffer.wrap(b, 2, 16);
             float[] p = new float[]{bb.getFloat(), bb.getFloat(), bb.getFloat(), bb.getFloat()};
@@ -460,14 +474,47 @@ public final class Mod {
             return;
         }
         try {
+            mpActive = true;
+            updateRole();
             nativeJoinGame(seed, gameNr);
         } catch (Throwable t) {
             log("Başlatılamadı: " + t);
         }
     }
 
+    /** 0 = tek kisilik, 1 = host (Granny AI calisir), 2 = istemci (Granny host'u taklit eder) */
+    private static void updateRole() {
+        if (!nativeOk) return;
+        int role = 0;
+        Net n = net;
+        if (mpActive && n != null && n.isOpen() && myId > 0) role = (myId == hostId) ? 1 : 2;
+        try {
+            nativeSetRole(role);
+        } catch (Throwable t) {
+        }
+    }
+
+    private static void nGranny(float x, float y, float z, float yaw) {
+        if (!nativeOk) return;
+        try {
+            nativeSetGranny(x, y, z, yaw);
+        } catch (Throwable t) {
+        }
+    }
+
+    /** Native taraftan cagrilir (host'ta, ~10 Hz): Granny'nin konumu. */
+    public static void onGrannyLocal(float x, float y, float z, float yaw) {
+        Net n = net;
+        if (n == null || !n.isOpen() || myId <= 0 || myId != hostId) return;
+        ByteBuffer bb = ByteBuffer.allocate(17);
+        bb.put((byte) 2).putFloat(x).putFloat(y).putFloat(z).putFloat(yaw);
+        n.sendBinary(bb.array());
+    }
+
     /** Host: tohumu ve kayit degerini okutup herkese baslat mesaji gonderir. */
     private static void nHostStart(int seed) {
+        mpActive = true;
+        updateRole();
         if (!nativeOk) {
             gameNr = -1;
             sendStartMsg();
@@ -632,6 +679,7 @@ public final class Mod {
                 nRemove(id);
                 removeTag(id);
                 hostId = o.optInt("host", hostId);
+                updateRole();
                 log("#" + id + " ayrıldı" + (hostId == myId ? " (artık HOST sensin)" : ""));
             } else if ("start".equals(t)) {
                 int from = o.optInt("from");
