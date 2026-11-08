@@ -74,6 +74,8 @@ public final class Mod {
 
     private static native void nativeGrannyAnim(String name, float fade);
 
+    private static native void nativeWorldAnim(String name, float fade, float x, float y, float z);
+
     private static native void nativeSetGranny(float x, float y, float z, float yaw);
 
     private Mod() {
@@ -504,6 +506,23 @@ public final class Mod {
         }
     }
 
+    /** Native taraftan cagrilir: bir kapi/nesne animasyonu basladi (fade < 0 ise Play). */
+    public static void onWorldAnim(String name, float fade, float x, float y, float z) {
+        Net n = net;
+        if (n == null || !n.isOpen() || myId <= 0) return;
+        try {
+            JSONObject o = new JSONObject();
+            o.put("t", "wanim");
+            o.put("n", name);
+            o.put("f", (double) fade);
+            o.put("x", (double) x);
+            o.put("y", (double) y);
+            o.put("z", (double) z);
+            n.sendText(o.toString());
+        } catch (Exception e) {
+        }
+    }
+
     /** Native taraftan cagrilir (host'ta): Granny bir animasyon baslatti (fade < 0 ise Play). */
     public static void onGrannyAnim(String name, float fade) {
         Net n = net;
@@ -710,6 +729,14 @@ public final class Mod {
                     } else {
                         log("Host oyunu başlattı, oyuna katılınıyor... (tohum " + gameSeed + ")");
                         nStart(gameSeed);
+                    }
+                }
+            } else if ("wanim".equals(t)) {
+                if (nativeOk) {
+                    try {
+                        nativeWorldAnim(o.optString("n", ""), (float) o.optDouble("f", 0.3),
+                                (float) o.optDouble("x", 0), (float) o.optDouble("y", 0), (float) o.optDouble("z", 0));
+                    } catch (Throwable x) {
                     }
                 }
             } else if ("ganim".equals(t)) {

@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #define TAG "GrannyMP"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -304,10 +305,14 @@ static volatile int g_hostNR = -1;
 static jmethodID g_onHostStart = nullptr;
 static jmethodID g_onGranny = nullptr;
 static volatile int g_gHave = 0;
-static volatile int g_blockGranny = 0;       // olum/yeni gun sirasinda Granny'yi isinlama
+static volatile int g_blockGranny = 0;
+static const char *g_ctx = nullptr;       // olum/yeni gun sirasinda Granny'yi isinlama
 static intptr_t g_grannyCached = 0;          // Granny transform (yerel isaretci)
 static void *g_grannySelf = nullptr;         // EnemyAIGranny ornegi
 static jmethodID g_onGrannyAnim = nullptr;
+static jmethodID g_onWorldAnim = nullptr;
+static volatile int g_animReset = 0;
+static void process_world_anims();
 static volatile int g_startSeed = 0;
 static volatile int g_gameSeed = 0;
 typedef void (*InitStateFn)(int seed, const void *mi);
@@ -317,6 +322,7 @@ static const uintptr_t RVA_LOAD_SCENE = 0x2AAF058;  // SceneManager.LoadScene(st
 
 static void hook_EsUpdate(void *self, const void *mi) {
     orig_EsUpdate(self, mi);
+    process_world_anims();
     if (!g_startReq) return;
     g_startReq = 0;
     void *h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
@@ -361,6 +367,7 @@ Java_com_dvloper_mod_Mod_nativeHostStart(JNIEnv *, jclass, jint seed) {
     g_gameSeed = seed;
     g_hostNR = -1;
     g_gHave = 0;
+    g_animReset = 1;
     g_startAnnounce = 1;
     g_startReq = 1;
 }
@@ -371,6 +378,7 @@ Java_com_dvloper_mod_Mod_nativeJoinGame(JNIEnv *, jclass, jint seed, jint nr) {
     g_gameSeed = seed;
     g_hostNR = nr;
     g_gHave = 0;
+    g_animReset = 1;
     g_startAnnounce = 0;
     g_startReq = 1;
 }
@@ -443,10 +451,15 @@ static bool hook_DayStart(void *self, const void *mi) {
 
 static bool hook_DayAds(void *self, const void *mi) {
     day_seed(self, 11, "YeniGun");
-    bool blk = g_role_for_block();
-    if (blk) g_blockGranny = 1;
+    int prev = g_blockGranny;
+    const char *pc = g_ctx;
+    if (g_role_for_block()) {
+        g_blockGranny = 1;
+        g_ctx = "yeni gun";
+    }
     bool r = orig_DayAds(self, mi);
-    g_blockGranny = 0;
+    g_blockGranny = prev;
+    g_ctx = pc;
     return r;
 }
 
@@ -514,7 +527,6 @@ static UpdateFn orig_GrannyFixed = nullptr;
 static CrossFadeFn orig_CrossFade = nullptr;
 static PlayFn orig_Play = nullptr;
 static SetVecFn orig_SetPos = nullptr;
-static MoveNextFn orig_CaughtMove = nullptr;
 static const uintptr_t RVA_GRANNY_FIXED = 0x14549E4;    // EnemyAIGranny.FixedUpdate
 static const uintptr_t RVA_SET_POS = 0x2AA91EC;         // Transform.set_position_Injected
 static const uintptr_t RVA_SET_ROT = 0x2AA988C;         // Transform.set_rotation_Injected
@@ -582,30 +594,84 @@ static bool is_granny_anim(void *anim) {
     return go == getGo(g_grannySelf, nullptr);
 }
 
-static int g_animLogs = 0, g_animMiss = 0;
+static int g_animLogs = 0;
+static char g_lastGranny[48] = {0};
+static int64_t g_lastGrannyMs = 0;
+
+static int64_t now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Dunya animasyonlari (kapilar vb.) icin tekrar engelleme tablosu
+struct SentEnt {
+    uint32_t hash;
+    int64_t ms;
+};
+static SentEnt g_sent[16];
+static int g_sentPos = 0;
+
+static uint32_t hash_anim(const char *name, const Vec3 &p) {
+    uint32_t h = 2166136261u;
+    for (const char *c = name; *c; c++) h = (h ^ (uint8_t) *c) * 16777619u;
+    int qx = (int) floorf(p.x * 2.0f), qy = (int) floorf(p.y * 2.0f), qz = (int) floorf(p.z * 2.0f);
+    h = (h ^ (uint32_t) qx) * 16777619u;
+    h = (h ^ (uint32_t) qy) * 16777619u;
+    h = (h ^ (uint32_t) qz) * 16777619u;
+    return h;
+}
+
+typedef void *(*GetTrFn)(void *comp, const void *mi);
+static const uintptr_t RVA_GET_TRANSFORM = 0x2A9A5B0;   // Component.get_transform
 
 static void forward_anim(void *anim, void *nameStr, float fade) {
-    if (g_role != 1) return;
+    if (g_role == 0 || !anim) return;
+    if (g_animReset) {
+        g_animReset = 0;
+        g_lastGranny[0] = 0;
+        memset(g_sent, 0, sizeof(g_sent));
+    }
     char nm[48];
     il2str_ascii(nameStr, nm, sizeof(nm));
     char b[96];
-    if (!is_granny_anim(anim)) {
-        if (g_animMiss < 3) {
-            g_animMiss++;
-            snprintf(b, sizeof(b), "anim? (granny degil): %s", nm);
+    JNIEnv *env = env_for_thread();
+    if (!env || !g_modClass) return;
+    if (is_granny_anim(anim)) {
+        if (g_role != 1 || !g_onGrannyAnim) return;
+        int64_t t = now_ms();
+        if (strcmp(nm, g_lastGranny) == 0 && t - g_lastGrannyMs < 4000) return;
+        strncpy(g_lastGranny, nm, sizeof(g_lastGranny) - 1);
+        g_lastGrannyMs = t;
+        if (g_animLogs < 6) {
+            g_animLogs++;
+            snprintf(b, sizeof(b), "granny anim: %s (%.2f)", nm, fade);
             jlog(b);
         }
+        jstring js = env->NewStringUTF(nm);
+        env->CallStaticVoidMethod(g_modClass, g_onGrannyAnim, js, fade);
+        env->DeleteLocalRef(js);
+        if (env->ExceptionCheck()) env->ExceptionClear();
         return;
     }
-    if (g_animLogs < 6) {
-        g_animLogs++;
-        snprintf(b, sizeof(b), "granny anim: %s (%.2f)", nm, fade);
-        jlog(b);
+    // Dunya animasyonu (kapi, cekmece, tuzak...): konumla birlikte herkese yayilir
+    if (!g_onWorldAnim) return;
+    void *tr = ((GetTrFn) (g_base + RVA_GET_TRANSFORM))(anim, nullptr);
+    if (!tr) return;
+    intptr_t cached = *(intptr_t *) ((uintptr_t) tr + OFF_CACHED_PTR);
+    if (!cached) return;
+    Vec3 p = {0, 0, 0};
+    ((GetVec3Fn) (g_base + RVA_GET_POS))(cached, &p, nullptr);
+    uint32_t h = hash_anim(nm, p);
+    int64_t t = now_ms();
+    for (int i = 0; i < 16; i++) {
+        if (g_sent[i].hash == h && t - g_sent[i].ms < 1500) return;
     }
-    JNIEnv *env = env_for_thread();
-    if (!env || !g_modClass || !g_onGrannyAnim) return;
+    g_sent[g_sentPos].hash = h;
+    g_sent[g_sentPos].ms = t;
+    g_sentPos = (g_sentPos + 1) % 16;
     jstring js = env->NewStringUTF(nm);
-    env->CallStaticVoidMethod(g_modClass, g_onGrannyAnim, js, fade);
+    env->CallStaticVoidMethod(g_modClass, g_onWorldAnim, js, fade, p.x, p.y, p.z);
     env->DeleteLocalRef(js);
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
@@ -622,24 +688,63 @@ static bool hook_Play(void *self, void *name, int mode, const void *mi) {
 }
 
 static void hook_SetPos(intptr_t self, const Vec3 *v, const void *mi) {
-    if (g_blockGranny && g_grannyCached && self == g_grannyCached) {
-        static int blocked = 0;
-        if (blocked < 6) {
-            blocked++;
-            jlog("Granny isinlanmasi engellendi");
+    if (g_role != 0 && g_grannyCached && self == g_grannyCached) {
+        static int logs = 0;
+        char b[120];
+        if (g_blockGranny) {
+            if (logs < 12) {
+                logs++;
+                snprintf(b, sizeof(b), "Granny isinlanmasi engellendi [%s]", g_ctx ? g_ctx : "?");
+                jlog(b);
+            }
+            return;
         }
-        return;
+        if (logs < 12) {
+            logs++;
+            snprintf(b, sizeof(b), "Granny konumu degisti (engel yok) %.1f %.1f %.1f", v->x, v->y, v->z);
+            jlog(b);
+        }
     }
     if (orig_SetPos) orig_SetPos(self, v, mi);
 }
 
-static bool hook_CaughtMove(void *self, const void *mi) {
-    if (g_role != 0) g_blockGranny = 1;
-    bool r = orig_CaughtMove(self, mi);
-    g_blockGranny = 0;
-    return r;
+// Olum / yeni gun akisindaki coroutine'lerde Granny'nin isinlanmasini engelle
+#define DEATH_HOOK(NAME, TAG) \
+    static MoveNextFn orig_##NAME = nullptr; \
+    static bool hook_##NAME(void *self, const void *mi) { \
+        int prev = g_blockGranny; \
+        const char *pc = g_ctx; \
+        if (g_role != 0) { g_blockGranny = 1; g_ctx = TAG; } \
+        bool r = orig_##NAME(self, mi); \
+        g_blockGranny = prev; \
+        g_ctx = pc; \
+        return r; \
+    }
+
+DEATH_HOOK(CaughtMove, "yakalandi")
+DEATH_HOOK(EndDay, "gun sonu")
+DEATH_HOOK(UnderBed, "yatak alti")
+DEATH_HOOK(EndScene3, "bitis sahnesi 3")
+DEATH_HOOK(EndScene, "bitis sahnesi")
+
+static UpdateFn orig_SpiderReset = nullptr;
+static void hook_SpiderReset(void *self, const void *mi) {
+    int prev = g_blockGranny;
+    const char *pc = g_ctx;
+    if (g_role != 0) {
+        g_blockGranny = 1;
+        g_ctx = "orumcek";
+    }
+    orig_SpiderReset(self, mi);
+    g_blockGranny = prev;
+    g_ctx = pc;
 }
 
+
+typedef void *(*GetStateFn)(void *anim, void *name, const void *mi);
+typedef void (*SetSpeedFn)(void *state, float v, const void *mi);
+static const uintptr_t RVA_ANIM_GETITEM = 0x2A60310;       // Animation.get_Item(string)
+static const uintptr_t RVA_ANIMSTATE_SETSPEED = 0x2A60EE8; // AnimationState.set_speed
 static void *g_animComp = nullptr;
 static void *g_animCompFor = nullptr;
 
@@ -667,6 +772,9 @@ static void client_apply_anims(void *self) {
         } else if (orig_CrossFade) {
             orig_CrossFade(g_animComp, nm, ev.fade, 0, nullptr);
         }
+        // Istemcide yapay zeka kapali oldugu icin animasyon hizi 0'da kalabiliyor: 1'e esitle
+        void *st = ((GetStateFn) (g_base + RVA_ANIM_GETITEM))(g_animComp, nm, nullptr);
+        if (st) ((SetSpeedFn) (g_base + RVA_ANIMSTATE_SETSPEED))(st, 1.0f, nullptr);
     }
 }
 
@@ -711,6 +819,143 @@ static void hook_GrannyFixed(void *self, const void *mi) {
     SetVecFn sp = orig_SetPos ? orig_SetPos : (SetVecFn) (g_base + RVA_SET_POS);
     sp(g_grannyCached, &p, nullptr);
     ((SetQuatFn) (g_base + RVA_SET_ROT))(g_grannyCached, &q, nullptr);
+}
+
+// --- Dunya animasyonlari (kapilar vb.): alici tarafta en yakin Animation bileseni bulunup oynatilir ---
+struct WAnim {
+    char name[48];
+    float fade, x, y, z;
+};
+static WAnim g_wq[8];
+static int g_wHead = 0, g_wTail = 0;
+static pthread_mutex_t g_wMx = PTHREAD_MUTEX_INITIALIZER;
+
+static void wanim_push(const char *n, float f, float x, float y, float z) {
+    pthread_mutex_lock(&g_wMx);
+    int next = (g_wHead + 1) % 8;
+    if (next != g_wTail) {
+        strncpy(g_wq[g_wHead].name, n, 47);
+        g_wq[g_wHead].name[47] = 0;
+        g_wq[g_wHead].fade = f;
+        g_wq[g_wHead].x = x;
+        g_wq[g_wHead].y = y;
+        g_wq[g_wHead].z = z;
+        g_wHead = next;
+    }
+    pthread_mutex_unlock(&g_wMx);
+}
+
+static bool wanim_pop(WAnim *out) {
+    pthread_mutex_lock(&g_wMx);
+    bool ok = g_wTail != g_wHead;
+    if (ok) {
+        *out = g_wq[g_wTail];
+        g_wTail = (g_wTail + 1) % 8;
+    }
+    pthread_mutex_unlock(&g_wMx);
+    return ok;
+}
+
+typedef void *(*DomainGetFn)();
+typedef void **(*DomainAsmsFn)(void *domain, size_t *size);
+typedef void *(*AsmImageFn)(void *asm_);
+typedef const char *(*ImageNameFn)(void *image);
+typedef void *(*ClassFromNameFn)(void *image, const char *ns, const char *name);
+typedef void *(*ClassTypeFn)(void *klass);
+typedef void *(*TypeObjFn)(void *type);
+typedef void *(*FindObjsFn)(void *type, const void *mi);
+static const uintptr_t RVA_FIND_OBJECTS = 0x2AA37A8;   // Object.FindObjectsOfType(Type)
+
+static void *il2_type_object(const char *imageName, const char *ns, const char *cls) {
+    void *h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) return nullptr;
+    DomainGetFn dget = (DomainGetFn) dlsym(h, "il2cpp_domain_get");
+    DomainAsmsFn dasm = (DomainAsmsFn) dlsym(h, "il2cpp_domain_get_assemblies");
+    AsmImageFn aimg = (AsmImageFn) dlsym(h, "il2cpp_assembly_get_image");
+    ImageNameFn iname = (ImageNameFn) dlsym(h, "il2cpp_image_get_name");
+    ClassFromNameFn cfn = (ClassFromNameFn) dlsym(h, "il2cpp_class_from_name");
+    ClassTypeFn ctype = (ClassTypeFn) dlsym(h, "il2cpp_class_get_type");
+    TypeObjFn tobj = (TypeObjFn) dlsym(h, "il2cpp_type_get_object");
+    if (!dget || !dasm || !aimg || !iname || !cfn || !ctype || !tobj) return nullptr;
+    size_t n = 0;
+    void **asms = dasm(dget(), &n);
+    for (size_t i = 0; i < n; i++) {
+        void *img = aimg(asms[i]);
+        const char *nm = img ? iname(img) : nullptr;
+        if (nm && strcmp(nm, imageName) == 0) {
+            void *k = cfn(img, ns, cls);
+            if (!k) return nullptr;
+            return tobj(ctype(k));
+        }
+    }
+    return nullptr;
+}
+
+static void *g_animTypeObj = nullptr;
+static bool g_animTypeTried = false;
+
+static void process_world_anims() {
+    WAnim ev;
+    while (wanim_pop(&ev)) {
+        if (g_role == 0) continue;
+        if (!g_animTypeObj && !g_animTypeTried) {
+            g_animTypeTried = true;
+            g_animTypeObj = il2_type_object("UnityEngine.AnimationModule.dll", "UnityEngine", "Animation");
+            jlog(g_animTypeObj ? "Animasyon tipi bulundu" : "Animasyon tipi YOK");
+        }
+        if (!g_animTypeObj || !orig_Play || !orig_CrossFade) continue;
+        void *arr = ((FindObjsFn) (g_base + RVA_FIND_OBJECTS))(g_animTypeObj, nullptr);
+        if (!arr) continue;
+        int64_t len = *(int64_t *) ((uintptr_t) arr + 0x18);
+        void **items = (void **) ((uintptr_t) arr + 0x20);
+        void *best = nullptr;
+        float bd = 1e9f;
+        for (int64_t i = 0; i < len && i < 512; i++) {
+            void *comp = items[i];
+            if (!comp || is_granny_anim(comp)) continue;
+            void *tr = ((GetTrFn) (g_base + RVA_GET_TRANSFORM))(comp, nullptr);
+            if (!tr) continue;
+            intptr_t c = *(intptr_t *) ((uintptr_t) tr + OFF_CACHED_PTR);
+            if (!c) continue;
+            Vec3 p = {0, 0, 0};
+            ((GetVec3Fn) (g_base + RVA_GET_POS))(c, &p, nullptr);
+            float dx = p.x - ev.x, dy = p.y - ev.y, dz = p.z - ev.z;
+            float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d < bd) {
+                bd = d;
+                best = comp;
+            }
+        }
+        static int wlogs = 0;
+        if (best && bd < 2.0f) {
+            void *nm = il2_str(ev.name);
+            if (nm) {
+                if (ev.fade < 0) orig_Play(best, nm, 0, nullptr);
+                else orig_CrossFade(best, nm, ev.fade, 0, nullptr);
+            }
+            if (wlogs < 8) {
+                wlogs++;
+                char b[96];
+                snprintf(b, sizeof(b), "dunya anim: %s (mesafe %.1f)", ev.name, bd);
+                jlog(b);
+            }
+        } else if (wlogs < 8) {
+            wlogs++;
+            char b[96];
+            snprintf(b, sizeof(b), "dunya anim: %s nesne bulunamadi (en yakin %.1f)", ev.name, bd);
+            jlog(b);
+        }
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dvloper_mod_Mod_nativeWorldAnim(JNIEnv *env, jclass, jstring name, jfloat fade, jfloat x, jfloat y, jfloat z) {
+    if (!name) return;
+    const char *c = env->GetStringUTFChars(name, nullptr);
+    if (c) {
+        wanim_push(c, fade, x, y, z);
+        env->ReleaseStringUTFChars(name, c);
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -826,6 +1071,24 @@ static void *init_thread(void *) {
         char ab[96];
         snprintf(ab, sizeof(ab), "Animasyon hook: cf=%d play=%d setpos=%d yakalandi=%d (0=tamam)", ra, rb, rc, rd);
         jlog(ab);
+        static const uint32_t expE1[4] = {0xa9bc67fe, 0xa9015ff8, 0xa90257f6, 0xa9034ff4};
+        static const uint32_t expE2[4] = {0xa9bd5ffe, 0xa90157f6, 0xa9024ff4, 0xd000dcb3};
+        static const uint32_t expE3[4] = {0xa9bd5ffe, 0xa90157f6, 0xa9024ff4, 0xf000dc94};
+        static const uint32_t expE4[4] = {0xf81e0ffe, 0xa9014ff4, 0xf000dfb4, 0xaa0003f3};
+        void *p1 = nullptr, *p2 = nullptr, *p3 = nullptr, *p4 = nullptr, *p5 = nullptr;
+        int q1 = inline_hook((void *) (base + 0x1516AB0), (void *) hook_EndDay, &p1, expE1);
+        int q2 = inline_hook((void *) (base + 0x1542118), (void *) hook_UnderBed, &p2, expE2);
+        int q3 = inline_hook((void *) (base + 0x15452E8), (void *) hook_EndScene3, &p3, expE3);
+        int q4 = inline_hook((void *) (base + 0x1545B38), (void *) hook_EndScene, &p4, expE3);
+        int q5 = inline_hook((void *) (base + 0x14E1A14), (void *) hook_SpiderReset, &p5, expE4);
+        if (q1 == 0) orig_EndDay = (MoveNextFn) p1;
+        if (q2 == 0) orig_UnderBed = (MoveNextFn) p2;
+        if (q3 == 0) orig_EndScene3 = (MoveNextFn) p3;
+        if (q4 == 0) orig_EndScene = (MoveNextFn) p4;
+        if (q5 == 0) orig_SpiderReset = (UpdateFn) p5;
+        char ob[96];
+        snprintf(ob, sizeof(ob), "Olum hook: %d %d %d %d %d (0=tamam)", q1, q2, q3, q4, q5);
+        jlog(ob);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
@@ -852,6 +1115,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     g_onHostStart = env->GetStaticMethodID(c, "onHostStartReady", "(I)V");
     g_onGranny = env->GetStaticMethodID(c, "onGrannyLocal", "(FFFF)V");
     g_onGrannyAnim = env->GetStaticMethodID(c, "onGrannyAnim", "(Ljava/lang/String;F)V");
+    g_onWorldAnim = env->GetStaticMethodID(c, "onWorldAnim", "(Ljava/lang/String;FFFF)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     pthread_t t;
     pthread_create(&t, nullptr, init_thread, nullptr);
