@@ -303,6 +303,7 @@ static volatile int g_startAnnounce = 0;
 static volatile int g_hostNR = -1;
 static jmethodID g_onHostStart = nullptr;
 static jmethodID g_onGranny = nullptr;
+static volatile int g_gHave = 0;
 static volatile int g_startSeed = 0;
 static volatile int g_gameSeed = 0;
 typedef void (*InitStateFn)(int seed, const void *mi);
@@ -502,7 +503,6 @@ static const uintptr_t RVA_BEH_SET_ENABLED = 0x2A99DB4; // Behaviour.set_enabled
 static const uintptr_t OFF_GRANNY_TRANSFORM = 0x28;    // EnemyAIGranny.myTransform
 static const uintptr_t OFF_GRANNY_NAV = 0x108;         // EnemyAIGranny.navComponent
 static volatile int g_role = 0; // 0 = tek kisilik, 1 = host, 2 = istemci
-static volatile int g_gHave = 0;
 static float g_gx = 0, g_gy = 0, g_gz = 0, g_gyaw = 0;
 static int g_gTick = 0;
 static void *g_navFor = nullptr;
