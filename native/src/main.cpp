@@ -676,12 +676,39 @@ static void forward_anim(void *anim, void *nameStr, float fade) {
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
+// Olum/yeni gun akisinda kapi-cekmece "kapanma" animasyonlarini engelle (ve kaydet)
+static bool name_has_clos(const char *n) {
+    char low[48];
+    int i = 0;
+    for (; n[i] && i < 47; i++) low[i] = (n[i] >= 'A' && n[i] <= 'Z') ? (char) (n[i] + 32) : n[i];
+    low[i] = 0;
+    return strstr(low, "clos") != nullptr;
+}
+
+static bool death_block_anim(void *anim, void *nameStr) {
+    if (!g_blockGranny || g_role == 0) return false;
+    char nm[48];
+    il2str_ascii(nameStr, nm, sizeof(nm));
+    if (is_granny_anim(anim)) return false;
+    bool blk = name_has_clos(nm);
+    static int logs = 0;
+    if (logs < 20) {
+        logs++;
+        char b[110];
+        snprintf(b, sizeof(b), "olum anim: %s [%s]", nm, blk ? "engellendi" : "gecti");
+        jlog(b);
+    }
+    return blk;
+}
+
 static void hook_CrossFade(void *self, void *name, float fade, int mode, const void *mi) {
+    if (death_block_anim(self, name)) return;
     orig_CrossFade(self, name, fade, mode, mi);
     forward_anim(self, name, fade);
 }
 
 static bool hook_Play(void *self, void *name, int mode, const void *mi) {
+    if (death_block_anim(self, name)) return false;
     bool r = orig_Play(self, name, mode, mi);
     forward_anim(self, name, -1.0f);
     return r;
@@ -706,6 +733,35 @@ static void hook_SetPos(intptr_t self, const Vec3 *v, const void *mi) {
         }
     }
     if (orig_SetPos) orig_SetPos(self, v, mi);
+}
+
+// Yonetilen Transform.set_position(Vector3): enjekte surumu icine gomuldugu icin oyun kodu bunu dogrudan cagirir
+typedef void (*SetPosMFn)(void *self, Vec3 v, const void *mi);
+static SetPosMFn orig_SetPosM = nullptr;
+static const uintptr_t RVA_SET_POS_M = 0x2AA9164;   // Transform.set_position(Vector3)
+
+static void hook_SetPosM(void *self, Vec3 v, const void *mi) {
+    if (g_role != 0 && g_grannyCached && self) {
+        intptr_t c = *(intptr_t *) ((uintptr_t) self + OFF_CACHED_PTR);
+        if (c == g_grannyCached) {
+            static int logsBlocked = 0, logsFree = 0;
+            char b[128];
+            if (g_blockGranny) {
+                if (logsBlocked < 12) {
+                    logsBlocked++;
+                    snprintf(b, sizeof(b), "Granny isinlanmasi engellendi [%s]", g_ctx ? g_ctx : "?");
+                    jlog(b);
+                }
+                return;
+            }
+            if (logsFree < 6) {
+                logsFree++;
+                snprintf(b, sizeof(b), "Granny konumu degisti (engel yok) %.1f %.1f %.1f", v.x, v.y, v.z);
+                jlog(b);
+            }
+        }
+    }
+    if (orig_SetPosM) orig_SetPosM(self, v, mi);
 }
 
 // Olum / yeni gun akisindaki coroutine'lerde Granny'nin isinlanmasini engelle
@@ -1089,6 +1145,13 @@ static void *init_thread(void *) {
         char olumBuf[96];
         snprintf(olumBuf, sizeof(olumBuf), "Olum hook: %d %d %d %d %d (0=tamam)", q1, q2, q3, q4, q5);
         jlog(olumBuf);
+        static const uint32_t expSm[4] = {0xd100c3ff, 0xf9000bfe, 0xa9024ff4, 0xf00031b4};
+        void *osm = nullptr;
+        int rsm = inline_hook((void *) (base + RVA_SET_POS_M), (void *) hook_SetPosM, &osm, expSm);
+        if (rsm == 0) orig_SetPosM = (SetPosMFn) osm;
+        char smBuf[64];
+        snprintf(smBuf, sizeof(smBuf), "SetPos(yonetilen) hook: %d (0=tamam)", rsm);
+        jlog(smBuf);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
