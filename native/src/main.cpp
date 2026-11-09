@@ -1086,9 +1086,9 @@ static void *init_thread(void *) {
         if (q3 == 0) orig_EndScene3 = (MoveNextFn) p3;
         if (q4 == 0) orig_EndScene = (MoveNextFn) p4;
         if (q5 == 0) orig_SpiderReset = (UpdateFn) p5;
-        char ob[96];
-        snprintf(ob, sizeof(ob), "Olum hook: %d %d %d %d %d (0=tamam)", q1, q2, q3, q4, q5);
-        jlog(ob);
+        char olumBuf[96];
+        snprintf(olumBuf, sizeof(olumBuf), "Olum hook: %d %d %d %d %d (0=tamam)", q1, q2, q3, q4, q5);
+        jlog(olumBuf);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
