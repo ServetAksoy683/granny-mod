@@ -309,7 +309,8 @@ static volatile int g_blockGranny = 0;
 static const char *g_ctx = nullptr;
 static volatile int g_releasePending = 0;    // yakalama sonrasi Granny'yi serbest birak
 static int64_t g_releaseAt = 0;
-static int64_t g_unprotectAt = 0;       // olum/yeni gun sirasinda Granny'yi isinlama
+static int64_t g_unprotectAt = 0;
+static int64_t g_lastReleaseMs = 0;       // olum/yeni gun sirasinda Granny'yi isinlama
 static intptr_t g_grannyCached = 0;          // Granny transform (yerel isaretci)
 static void *g_grannySelf = nullptr;         // EnemyAIGranny ornegi
 static jmethodID g_onGrannyAnim = nullptr;
@@ -790,10 +791,23 @@ static bool hook_CaughtMove(void *self, const void *mi) {
     }
     int st = self ? *(int *) ((uintptr_t) self + 0x10) : -1; // <>1__state
     if (g_role == 1 && st == 0) {
-        g_releasePending = 1;
-        g_releaseAt = now_ms() + 2500;
+        int64_t t0 = now_ms();
+        if (!g_releasePending && t0 > g_lastReleaseMs + 8000) {
+            g_releasePending = 1;
+            g_releaseAt = t0 + 2500;
+        }
     }
     bool r = orig_CaughtMove(self, mi);
+    if (g_role == 1 && g_grannySelf) {
+        // Yakalama coroutine'i Granny'yi "bekleme" durumuna sokmaya calisir: her adimdan sonra geri al
+        uint8_t *g = (uint8_t *) g_grannySelf;
+        g[0x1F8] = 0; // playerGetCaught
+        g[0x1D1] = 0; // attackingPlayer
+        g[0x1D2] = 0; // huntPlayer
+        g[0x1E2] = 0; // startAttack
+        g[0x1FD] = 1; // dontHitPlayer
+        g_unprotectAt = now_ms() + 15000;
+    }
     g_blockGranny = prev;
     g_ctx = pc;
     return r;
@@ -802,6 +816,37 @@ DEATH_HOOK(EndDay, "gun sonu")
 DEATH_HOOK(UnderBed, "yatak alti")
 DEATH_HOOK(EndScene3, "bitis sahnesi 3")
 DEATH_HOOK(EndScene, "bitis sahnesi")
+
+typedef void (*NavSetFloatFn)(void *self, float v, const void *mi);
+typedef void (*NavSetBoolFn)(void *self, bool v, const void *mi);
+static NavSetFloatFn orig_NavSetSpeed = nullptr;
+static NavSetBoolFn orig_NavSetStopped = nullptr;
+static const uintptr_t RVA_NAV_SET_SPEED = 0x2A47994;   // NavMeshAgent.set_speed
+static const uintptr_t RVA_NAV_SET_STOPPED2 = 0x2A47768; // NavMeshAgent.set_isStopped
+
+static bool is_granny_nav(void *agent) {
+    if (!g_grannySelf || !agent) return false;
+    return agent == *(void **) ((uintptr_t) g_grannySelf + OFF_GRANNY_NAV);
+}
+
+static void hook_NavSetSpeed(void *self, float v, const void *mi) {
+    if (g_role != 0 && g_blockGranny && is_granny_nav(self)) {
+        static int logs = 0;
+        if (logs < 6) {
+            logs++;
+            char b[100];
+            snprintf(b, sizeof(b), "Granny hizi degistirilmedi [%s] (%.1f)", g_ctx ? g_ctx : "?", v);
+            jlog(b);
+        }
+        return;
+    }
+    if (orig_NavSetSpeed) orig_NavSetSpeed(self, v, mi);
+}
+
+static void hook_NavSetStopped(void *self, bool v, const void *mi) {
+    if (g_role != 0 && g_blockGranny && v && is_granny_nav(self)) return;
+    if (orig_NavSetStopped) orig_NavSetStopped(self, v, mi);
+}
 
 static UpdateFn orig_SpiderReset = nullptr;
 static void hook_SpiderReset(void *self, const void *mi) {
@@ -878,6 +923,7 @@ static void host_post_tick(void *self) {
     int64_t t = now_ms();
     if (g_releasePending && t >= g_releaseAt) {
         g_releasePending = 0;
+        g_lastReleaseMs = t;
         release_granny(self);
         g_unprotectAt = t + 15000;
     }
@@ -1206,6 +1252,16 @@ static void *init_thread(void *) {
         char smBuf[64];
         snprintf(smBuf, sizeof(smBuf), "SetPos(yonetilen) hook: %d (0=tamam)", rsm);
         jlog(smBuf);
+        static const uint32_t expNs[4] = {0xfc1e0fe8, 0xf90007fe, 0xa9014ff4, 0x1e204008};
+        static const uint32_t expNt[4] = {0xa9be57fe, 0xa9014ff4, 0xf00034b4, 0x2a0103f3};
+        void *ons = nullptr, *ont = nullptr;
+        int rns = inline_hook((void *) (base + RVA_NAV_SET_SPEED), (void *) hook_NavSetSpeed, &ons, expNs);
+        int rnt = inline_hook((void *) (base + RVA_NAV_SET_STOPPED2), (void *) hook_NavSetStopped, &ont, expNt);
+        if (rns == 0) orig_NavSetSpeed = (NavSetFloatFn) ons;
+        if (rnt == 0) orig_NavSetStopped = (NavSetBoolFn) ont;
+        char nvBuf[64];
+        snprintf(nvBuf, sizeof(nvBuf), "Nav hook: hiz=%d durdur=%d (0=tamam)", rns, rnt);
+        jlog(nvBuf);
     } else if (r == 1) {
         jlog("Hook basarisiz: oyun surumu farkli (imza uyusmuyor)");
     } else {
