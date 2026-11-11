@@ -306,7 +306,10 @@ static jmethodID g_onHostStart = nullptr;
 static jmethodID g_onGranny = nullptr;
 static volatile int g_gHave = 0;
 static volatile int g_blockGranny = 0;
-static const char *g_ctx = nullptr;       // olum/yeni gun sirasinda Granny'yi isinlama
+static const char *g_ctx = nullptr;
+static volatile int g_releasePending = 0;    // yakalama sonrasi Granny'yi serbest birak
+static int64_t g_releaseAt = 0;
+static int64_t g_unprotectAt = 0;       // olum/yeni gun sirasinda Granny'yi isinlama
 static intptr_t g_grannyCached = 0;          // Granny transform (yerel isaretci)
 static void *g_grannySelf = nullptr;         // EnemyAIGranny ornegi
 static jmethodID g_onGrannyAnim = nullptr;
@@ -777,7 +780,24 @@ static void hook_SetPosM(void *self, Vec3 v, const void *mi) {
         return r; \
     }
 
-DEATH_HOOK(CaughtMove, "yakalandi")
+static MoveNextFn orig_CaughtMove = nullptr;
+static bool hook_CaughtMove(void *self, const void *mi) {
+    int prev = g_blockGranny;
+    const char *pc = g_ctx;
+    if (g_role != 0) {
+        g_blockGranny = 1;
+        g_ctx = "yakalandi";
+    }
+    int st = self ? *(int *) ((uintptr_t) self + 0x10) : -1; // <>1__state
+    if (g_role == 1 && st == 0) {
+        g_releasePending = 1;
+        g_releaseAt = now_ms() + 2500;
+    }
+    bool r = orig_CaughtMove(self, mi);
+    g_blockGranny = prev;
+    g_ctx = pc;
+    return r;
+}
 DEATH_HOOK(EndDay, "gun sonu")
 DEATH_HOOK(UnderBed, "yatak alti")
 DEATH_HOOK(EndScene3, "bitis sahnesi 3")
@@ -834,6 +854,39 @@ static void client_apply_anims(void *self) {
     }
 }
 
+typedef void (*SetBoolFn)(void *self, bool v, const void *mi);
+static const uintptr_t RVA_NEWNAV = 0x145BD34;          // EnemyAIGranny.newNav
+static const uintptr_t RVA_NAV_SET_STOPPED = 0x2A47768; // NavMeshAgent.set_isStopped
+
+// Yakalama sonrasi Granny beklemesin, gorevine (rastgele devriye) devam etsin
+static void release_granny(void *self) {
+    uint8_t *g = (uint8_t *) self;
+    g[0x1F8] = 0; // playerGetCaught
+    g[0x1D1] = 0; // attackingPlayer
+    g[0x1D2] = 0; // huntPlayer
+    g[0x1D3] = 0; // grannyIsFollow
+    g[0x1E2] = 0; // startAttack
+    g[0x1FD] = 1; // dontHitPlayer (oyuncu yeniden dogarken vurmasin)
+    void *nav = *(void **) ((uintptr_t) self + OFF_GRANNY_NAV);
+    if (nav) ((SetBoolFn) (g_base + RVA_NAV_SET_STOPPED))(nav, false, nullptr);
+    ((UpdateFn) (g_base + RVA_NEWNAV))(self, nullptr);
+    g[0x1E0] = 1; // startWalk
+    jlog("Granny gorevine devam ediyor (yeni devriye noktasi)");
+}
+
+static void host_post_tick(void *self) {
+    int64_t t = now_ms();
+    if (g_releasePending && t >= g_releaseAt) {
+        g_releasePending = 0;
+        release_granny(self);
+        g_unprotectAt = t + 15000;
+    }
+    if (g_unprotectAt && t >= g_unprotectAt) {
+        g_unprotectAt = 0;
+        ((uint8_t *) self)[0x1FD] = 0; // dontHitPlayer kapat
+    }
+}
+
 static void hook_GrannyFixed(void *self, const void *mi) {
     if (self) {
         g_grannySelf = self;
@@ -842,6 +895,7 @@ static void hook_GrannyFixed(void *self, const void *mi) {
     }
     if (g_role != 2) {
         orig_GrannyFixed(self, mi);
+        if (g_role == 1 && self) host_post_tick(self);
         if (g_role == 1 && self && (++g_gTick % 5) == 0) {
             if (!g_grannyCached) return;
             Vec3 p = {0, 0, 0};
